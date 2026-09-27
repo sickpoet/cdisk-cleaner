@@ -5,13 +5,13 @@ Windows 上一键清理 C 盘垃圾、临时文件和空文件夹的小工具。
 **它不扫描整个磁盘找"垃圾"**——那种做法迟早会出事。它内置一份经过人工审核的清理清单，
 只清清单里的东西，清单之外的一律不碰。
 
-![界面](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)
+![平台](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)
+![Python](https://img.shields.io/badge/python-3.8%2B-green)
+![依赖](https://img.shields.io/badge/dependencies-none-brightgreen)
+
 ![界面](screenshot.png)
 
 > 图为示例数据。实际运行时这一栏的数字取决于你机器上的情况。
-
-![语言](https://img.shields.io/badge/python-3.8%2B-green)
-![依赖](https://img.shields.io/badge/dependencies-none-brightgreen)
 
 ## 特点
 
@@ -89,7 +89,10 @@ python cdisk_cleaner.py
 
 - 默认**不勾选**
 - 扫描时**跳过所有系统目录与保护区**
-- 只是把找得到的空目录列出来，让你自己判断
+- 点「ALL」全选时，盘符根下的**顶层**空目录也会跳过——`D:\WeGameApps`、
+  `D:\Netease\...` 这类多半是程序自己建的占位目录，运行时才往里写东西，
+  删了可能让程序报错。真要清理得单独勾
+- 清理前还会再过一遍路径守卫，盘符根、系统关键目录一个都不放过
 
 如果你看到这一栏里没几个项目，那是正常的，也是对的。
 

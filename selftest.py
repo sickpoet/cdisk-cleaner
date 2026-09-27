@@ -14,11 +14,23 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-import tkinter as tk  # noqa: E402
-
 import cdisk_cleaner as C  # noqa: E402
 
-C.tk = tk
+# --no-gui：跳过所有需要真实窗口的用例。给 CI 用——那边没有桌面会话，
+# 建不出 Tk 窗口。守卫、扫描、清理这些真正要紧的用例本来就不依赖 tkinter。
+NO_GUI = "--no-gui" in sys.argv
+
+tk = None
+if NO_GUI:
+    print("（--no-gui：本次跳过全部界面用例）")
+else:
+    try:
+        import tkinter as tk  # noqa: E402
+    except ImportError:
+        tk = None
+        print("（本机没有 tkinter，跳过全部界面用例）")
+    else:
+        C.tk = tk
 
 PASS = []
 FAIL = []
@@ -172,7 +184,20 @@ finally:
     C._rmtree_force(sandbox)
     check("清理测试目录", not os.path.exists(sandbox))
 
+def _finish():
+    """结算并退出。提出来是为了让 --no-gui 能在界面用例之前就收工。"""
+    print("\n" + "=" * 46)
+    print("通过 %d 项，失败 %d 项" % (len(PASS), len(FAIL)))
+    if FAIL:
+        for f in FAIL:
+            print("  失败: %s" % f)
+    sys.exit(1 if FAIL else 0)
+
+
 print("\n=== 界面组件 ===")
+if tk is None:
+    _finish()
+
 root = tk.Tk()
 root.withdraw()
 try:
@@ -340,9 +365,4 @@ finally:
     except Exception:
         pass
 
-print("\n" + "=" * 46)
-print("通过 %d 项，失败 %d 项" % (len(PASS), len(FAIL)))
-if FAIL:
-    for f in FAIL:
-        print("  失败: %s" % f)
-sys.exit(1 if FAIL else 0)
+_finish()

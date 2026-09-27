@@ -1,0 +1,25 @@
+name: selftest
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  selftest:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # 先卡语法：打包脚本和图标脚本平时没人跑，写坏了不容易察觉
+      - name: 语法检查
+        run: python -m py_compile cdisk_cleaner.py build_exe.py make_icon.py selftest.py
+
+      # --no-gui：runner 上没有可用的桌面会话，建不出 Tk 窗口。
+      # 路径守卫、扫描与清理的端到端用例本来就不依赖 tkinter，照样跑。
+      - name: 回归自检
+        run: python selftest.py --no-gui

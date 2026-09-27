@@ -15,7 +15,7 @@ C 盘垃圾清理器
 只用标准库，零第三方依赖。
 """
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 APP_NAME = "C 盘垃圾清理器"
 
 import ctypes
@@ -145,6 +145,7 @@ def _local_user_profiles():
                         continue
         except OSError:
             pass
+    _USER_PROFILES = out
     return out
 
 
@@ -1238,6 +1239,9 @@ class CleanerApp(object):
         self._head_w = 0
         self._head_h = 58
         self._blink_on = True
+        # 标题栏还没画出来时先占个位，
+        # 免得 _tick_blink 提前跑起来 itemconfigure 到一个不存在的 item
+        self._blink = None
 
         setup_style(root)
         self._go_frameless()
@@ -1597,9 +1601,36 @@ class CleanerApp(object):
             return
         self._apply_appwindow()
 
-    @staticmethod
-    def _work_area():
-        """屏幕工作区（去掉任务栏）。最大化时用。"""
+    def _work_area(self):
+        """
+        窗口当前所在显示器的工作区（去掉任务栏）。最大化和居中都按它算。
+
+        SPI_GETWORKAREA 只返回主显示器的工作区，多屏时点最大化会把窗口
+        拽到主屏去，所以优先按窗口句柄找它自己那块屏。
+        """
+        class MONITORINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD),
+                        ("rcMonitor", wintypes.RECT),
+                        ("rcWork", wintypes.RECT),
+                        ("dwFlags", wintypes.DWORD)]
+
+        try:
+            u = ctypes.windll.user32
+            hwnd = u.GetParent(self.root.winfo_id())
+            MONITOR_DEFAULTTONEAREST = 2
+            hmon = u.MonitorFromWindow(ctypes.c_void_p(hwnd),
+                                       MONITOR_DEFAULTTONEAREST)
+            mi = MONITORINFO()
+            mi.cbSize = ctypes.sizeof(mi)
+            if hmon and u.GetMonitorInfoW(ctypes.c_void_p(hmon),
+                                          ctypes.byref(mi)):
+                r = mi.rcWork
+                if r.right > r.left and r.bottom > r.top:
+                    return r.left, r.top, r.right, r.bottom
+        except Exception:
+            pass
+
+        # 拿不到显示器信息就退回主屏工作区
         r = wintypes.RECT()
         try:
             ctypes.windll.user32.SystemParametersInfoW(
@@ -1822,11 +1853,15 @@ class CleanerApp(object):
     @staticmethod
     def _row_values(t):
         if t.exists is False:
-            return (UNCHECKED, t.label, PENDING, PENDING, t.note)
+            # 明确写「不存在」。只给个破折号的话，会跟「还没扫描」撞车
+            return (UNCHECKED, t.label, "不存在", PENDING, t.note)
         mark = CHECKED if t.checked else UNCHECKED
         if t.exists is None:
             return (mark, t.label, PENDING, PENDING, t.note)
         note = ("【需管理员】" + t.note) if t.need_admin else t.note
+        if t.errcount:
+            # 有读不进去的条目时数字会偏小，得说明白，否则会被当成「就这么点」
+            note = "【%d 项读不到，数字偏小】%s" % (t.errcount, note)
         return (mark, t.label, human_size(t.size),
                 "{:,}".format(t.files), note)
 
