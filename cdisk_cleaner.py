@@ -15,7 +15,7 @@ C 盘垃圾清理器
 只用标准库，零第三方依赖。
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 APP_NAME = "C 盘垃圾清理器"
 
 import ctypes
@@ -811,6 +811,354 @@ def scan_empty_dirs(progress=None, cancel=None, limit=20000):
     return found
 
 
+# ---------------------------------------------------------------- 主题
+#
+# 赛博朋克配色：近黑底 + 霓虹青主色 + 品红强调 + 琥珀警示。
+# tkinter 没有圆角、发光和透明度，所以「发光」靠多层描边叠加近似，
+# 「切角」靠 Canvas 多边形，控件本体仍是原生控件，可用性不打折。
+
+BG        = "#05070d"   # 窗口底色
+BG_DEEP   = "#03050a"   # 更深一层，用于凹槽与标题栏
+PANEL     = "#0a0f18"   # 面板
+PANEL_HI  = "#111d2b"   # 面板高亮（悬停）
+GRID      = "#0c1721"   # 背景网格线
+BORDER    = "#173040"   # 普通描边
+BORDER_HI = "#1f4a61"   # 高亮描边
+CYAN      = "#00e5ff"   # 主霓虹
+CYAN_DIM  = "#0b6d80"
+MAGENTA   = "#ff2d95"   # 强调霓虹
+PURPLE    = "#a24dff"
+AMBER     = "#ffb300"   # 警示（有副作用的项）
+GREEN     = "#3dff9a"
+TEXT      = "#b6e6f2"   # 正文
+TEXT_DIM  = "#4e7484"   # 次要文字
+TEXT_OFF  = "#243845"   # 禁用
+
+FONT_EN = "Consolas"            # 数字与西文，等宽
+FONT_UI = "Microsoft YaHei UI"  # 中文
+
+
+def _mix(color, factor):
+    """按系数调暗（<1）或调亮（>1）颜色，用来叠出假发光。"""
+    try:
+        c = color.lstrip("#")
+        r, g, b = (int(c[i:i + 2], 16) for i in (0, 2, 4))
+        f = lambda v: max(0, min(255, int(v * factor)))  # noqa: E731
+        return "#%02x%02x%02x" % (f(r), f(g), f(b))
+    except Exception:
+        return color
+
+
+class NeonButton(object):
+    """
+    赛博朋克按钮：对角切角的描边块，悬停时点亮成强调色。
+
+    用组合而不是继承 tk.Canvas —— 模块顶层 tk 还是 None，
+    继承会在 import 时就炸。转发 pack/grid/place 即可当普通控件用。
+    状态用 set_state() 而不是 configure(state=...)，免得覆盖 Canvas 的 configure。
+    """
+
+    CUT = 7  # 左上与右下的切角边长
+
+    def __init__(self, master, text, command=None, width=132, height=34,
+                 color=CYAN, hot=MAGENTA, font=None):
+        self._cmd = command
+        self._color = color
+        self._hot = hot
+        self._w, self._h = width, height
+        self._text = text
+        self._font = font or (FONT_UI, 10, "bold")
+        self._enabled = True
+        self._hover = False
+        self._pressed = False
+
+        self.cv = tk.Canvas(master, width=width, height=height, bg=BG,
+                            highlightthickness=0, bd=0, takefocus=0,
+                            cursor="hand2")
+        self.cv.bind("<Enter>", self._on_enter)
+        self.cv.bind("<Leave>", self._on_leave)
+        self.cv.bind("<Button-1>", self._on_press)
+        self.cv.bind("<ButtonRelease-1>", self._on_release)
+        self._draw()
+
+    # -------- 布局转发
+    def pack(self, **kw):
+        self.cv.pack(**kw)
+        return self
+
+    def grid(self, **kw):
+        self.cv.grid(**kw)
+        return self
+
+    def place(self, **kw):
+        self.cv.place(**kw)
+        return self
+
+    # -------- 交互
+    def _on_enter(self, _e):
+        if self._enabled:
+            self._hover = True
+            self._draw()
+
+    def _on_leave(self, _e):
+        self._hover = False
+        self._pressed = False
+        self._draw()
+
+    def _on_press(self, _e):
+        if not self._enabled:
+            return
+        self._pressed = True
+        self._draw()
+
+    def _on_release(self, _e):
+        fired = self._pressed
+        self._pressed = False
+        self._draw()
+        if fired and self._enabled and self._cmd:
+            self._cmd()
+
+    # -------- 对外接口
+    def set_state(self, state):
+        enabled = (state == "normal")
+        if enabled != self._enabled:
+            self._enabled = enabled
+            self.cv.configure(cursor="hand2" if enabled else "arrow")
+            self._draw()
+
+    def set_text(self, text):
+        if text != self._text:
+            self._text = text
+            self._draw()
+
+    # -------- 绘制
+    def _poly(self, pad):
+        c = self.CUT
+        x0, y0 = pad, pad
+        x1, y1 = self._w - pad, self._h - pad
+        return (x0 + c, y0, x1, y0, x1, y1 - c, x1 - c, y1,
+                x0, y1, x0, y0 + c)
+
+    def _draw(self):
+        self.cv.delete("all")
+        if not self._enabled:
+            line, fill, txt = TEXT_OFF, PANEL, TEXT_OFF
+        elif self._pressed:
+            line, fill, txt = self._hot, _mix(self._color, 0.30), "#ffffff"
+        elif self._hover:
+            line, fill, txt = self._hot, PANEL_HI, self._hot
+        else:
+            line, fill, txt = self._color, PANEL, self._color
+
+        # 外层稀薄描边 = 发散光晕
+        self.cv.create_polygon(self._poly(0), fill="", width=1,
+                               outline=_mix(line, 0.34))
+        self.cv.create_polygon(self._poly(2), fill=fill, outline=line, width=1)
+
+        mid = self._h / 2.0
+        self.cv.create_line(2, mid, 7, mid, fill=line, width=1)
+        self.cv.create_line(self._w - 7, mid, self._w - 2, mid, fill=line, width=1)
+        self.cv.create_text(self._w / 2.0, mid, text=self._text, fill=txt,
+                            font=self._font)
+
+
+class NeonRadio(object):
+    """
+    自绘单选按钮：方角框 + 内部亮点。
+
+    ttk 在 clam 下的 indicatorcolor 起不来（未选中的点仍然是系统白），
+    索性自己画，色彩和发光都能精确控制。
+    """
+
+    BOX = 15
+
+    def __init__(self, master, text, variable, value, color=CYAN):
+        self.variable = variable
+        self.value = value
+        self._color = color
+        self._text = text
+        self._hover = False
+
+        try:
+            from tkinter import font as tkfont
+            tw = tkfont.Font(font=(FONT_UI, 9)).measure(text)
+        except Exception:
+            tw = len(text) * 12
+
+        self.cv = tk.Canvas(master, width=self.BOX + 12 + tw, height=24,
+                            bg=BG, highlightthickness=0, bd=0, takefocus=0,
+                            cursor="hand2")
+        self.cv.bind("<Enter>", self._on_enter)
+        self.cv.bind("<Leave>", self._on_leave)
+        self.cv.bind("<Button-1>", self._pick)
+        try:
+            self.variable.trace_add("write", lambda *_: self._draw())
+        except Exception:
+            pass
+        self._draw()
+
+    def pack(self, **kw):
+        self.cv.pack(**kw)
+        return self
+
+    def _on_enter(self, _e):
+        self._hover = True
+        self._draw()
+
+    def _on_leave(self, _e):
+        self._hover = False
+        self._draw()
+
+    def _pick(self, _e):
+        self.variable.set(self.value)
+
+    def _draw(self):
+        self.cv.delete("all")
+        try:
+            on = bool(self.variable.get()) == bool(self.value)
+        except Exception:
+            on = False
+
+        line = self._color if on else (BORDER_HI if self._hover else BORDER)
+        txt = TEXT if (on or self._hover) else TEXT_DIM
+        b = self.BOX
+
+        # 外框（稀薄）+ 内框（实色）叠出发光感
+        self.cv.create_rectangle(1, 4, 1 + b + 2, 4 + b + 2, fill="",
+                                 outline=_mix(line, 0.32))
+        self.cv.create_rectangle(2, 5, 2 + b, 5 + b, fill=BG_DEEP, outline=line)
+        if on:
+            self.cv.create_rectangle(2 + 5, 5 + 5, 2 + b - 5, 5 + b - 5,
+                                     fill=self._color, outline="")
+        self.cv.create_text(b + 13, 13, text=self._text, anchor="w", fill=txt,
+                            font=(FONT_UI, 9))
+
+
+def _set_window_icon(root):
+    """换掉窗口与任务栏图标。打包后资源解压在 _MEIPASS 里。"""
+    for base in (getattr(sys, "_MEIPASS", None),
+                 os.path.dirname(os.path.abspath(__file__))):
+        if not base:
+            continue
+        p = os.path.join(base, "icon.ico")
+        if os.path.isfile(p):
+            try:
+                root.iconbitmap(default=p)
+                return True
+            except Exception:
+                continue
+    return False
+
+
+def pick_fonts(root):
+    """
+    挑一个可用的等宽字体。
+
+    Cascadia 的数字带斜杠，比 Consolas 更有仪表盘味；系统没有就退回 Consolas。
+    """
+    global FONT_EN, FONT_UI
+    try:
+        from tkinter import font as tkfont
+        have = set(tkfont.families(root))
+    except Exception:
+        return
+    for name in ("Cascadia Mono", "Cascadia Code", "Consolas"):
+        if name in have:
+            FONT_EN = name
+            break
+    for name in ("Microsoft YaHei UI", "Microsoft YaHei", "SimHei"):
+        if name in have:
+            FONT_UI = name
+            break
+
+
+def apply_dark_titlebar(root):
+    """
+    把 Windows 原生标题栏切成深色，和内部主题连成一片。
+
+    必须用 GetParent(winfo_id()) 取真正的顶层 HWND ——
+    winfo_id() 给的是 Tk 的内层窗口，拿它调用一律返回 E_HANDLE。
+    窗口还没映射时也可能失败，所以调用方会在显示后再补一次。
+    """
+    try:
+        root.update_idletasks()
+        hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
+        if not hwnd:
+            return False
+        fn = ctypes.windll.dwmapi.DwmSetWindowAttribute
+        fn.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c_void_p,
+                       wintypes.DWORD]
+        fn.restype = ctypes.c_long
+        value = ctypes.c_int(1)
+        for attr in (20, 19):  # 20 = Win10 1903+，19 = 1809
+            if fn(hwnd, attr, ctypes.cast(ctypes.byref(value), ctypes.c_void_p),
+                  ctypes.sizeof(value)) == 0:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def setup_style(root):
+    """
+    把 ttk 切到 clam 再逐项染色。
+
+    必须换主题：Windows 原生 vista 主题不接受颜色覆盖，
+    控件会顽固地保持灰白。clam 是唯一能整身改色的内置主题。
+    """
+    from tkinter import ttk
+
+    style = ttk.Style(root)
+    try:
+        style.theme_use("clam")
+    except Exception:
+        pass
+
+    # --- 选项卡
+    style.configure("Cyber.TNotebook", background=BG, borderwidth=0,
+                    tabmargins=(0, 0, 0, 0))
+    style.configure("Cyber.TNotebook.Tab", background=BG_DEEP,
+                    foreground=TEXT_DIM, font=(FONT_UI, 9, "bold"),
+                    padding=(22, 8), borderwidth=0)
+    style.map("Cyber.TNotebook.Tab",
+              background=[("selected", PANEL), ("active", PANEL_HI)],
+              foreground=[("selected", CYAN), ("active", TEXT)])
+
+    # --- 表格
+    style.configure("Cyber.Treeview", background=PANEL, fieldbackground=PANEL,
+                    foreground=TEXT, bordercolor=BORDER, borderwidth=0,
+                    relief="flat", rowheight=25, font=(FONT_UI, 9))
+    style.map("Cyber.Treeview",
+              background=[("selected", "#0e3b4d")],
+              foreground=[("selected", "#ffffff")])
+    style.configure("Cyber.Treeview.Heading", background=BG_DEEP,
+                    foreground=CYAN, relief="flat", borderwidth=0,
+                    font=(FONT_UI, 9, "bold"), padding=(10, 7),
+                    bordercolor=BORDER)
+    style.map("Cyber.Treeview.Heading",
+              background=[("active", PANEL_HI)],
+              foreground=[("active", MAGENTA)])
+
+    # --- 滚动条：砍掉箭头，只留轨道和滑块
+    for orient in ("Vertical", "Horizontal"):
+        name = "Cyber.%s.TScrollbar" % orient
+        style.configure(name, background=BORDER_HI, troughcolor=BG_DEEP,
+                        bordercolor=BG_DEEP, arrowcolor=CYAN,
+                        darkcolor=BORDER_HI, lightcolor=BORDER_HI,
+                        relief="flat", borderwidth=0, arrowsize=0)
+        style.map(name, background=[("active", CYAN), ("pressed", MAGENTA)])
+    style.layout("Cyber.Vertical.TScrollbar", [
+        ("Vertical.Scrollbar.trough",
+         {"children": [("Vertical.Scrollbar.thumb",
+                        {"expand": "1", "sticky": "nswe"})],
+          "sticky": "ns"})])
+    style.layout("Cyber.Horizontal.TScrollbar", [
+        ("Horizontal.Scrollbar.trough",
+         {"children": [("Horizontal.Scrollbar.thumb",
+                        {"expand": "1", "sticky": "nswe"})],
+          "sticky": "ew"})])
+
+
 # ---------------------------------------------------------------- GUI
 
 def _enable_dpi_awareness():
@@ -840,10 +1188,23 @@ class CleanerApp(object):
         self.cancel = threading.Event()
         self.use_recyclebin = tk.BooleanVar(value=False)
 
-        root.title("%s  v%s" % (APP_NAME, __version__))
-        root.geometry("900x660")
-        root.minsize(800, 580)
+        pick_fonts(root)
+        _set_window_icon(root)
+        root.title("%s  ::  v%s" % (APP_NAME, __version__))
+        root.configure(bg=BG)
+        root.geometry("1000x772")
+        root.minsize(920, 668)
 
+        # 顶部仪表盘要用到的动态文本句柄，_draw_head() 之后才有值
+        self._drive_item = None
+        self._drive_sub = None
+        self._drive_others = None
+        self._head_w = 0
+        self._head_h = 88
+        self._blink_on = True
+
+        apply_dark_titlebar(root)
+        setup_style(root)
         self._build_ui()
         self._refresh_drive_info()
         self.log("就绪。扫描过程只读，不会删任何东西。")
@@ -852,6 +1213,10 @@ class CleanerApp(object):
                      "等几项会被跳过，其余照常。")
 
         self.root.after(120, self._drain_queue)
+        self.root.after(620, self._tick_blink)
+        # 窗口真正映射之后再补设一次标题栏颜色：首次调用时 HWND 还没定型
+        self.root.after(90, lambda: apply_dark_titlebar(root))
+        self.root.after(600, lambda: apply_dark_titlebar(root))
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         if autoscan:
             self.root.after(400, self.on_scan)
@@ -861,84 +1226,189 @@ class CleanerApp(object):
     def _build_ui(self):
         from tkinter import ttk
 
-        outer = ttk.Frame(self.root, padding=(10, 8, 10, 8))
-        outer.pack(fill="both", expand=True)
+        pad = tk.Frame(self.root, bg=BG)
+        pad.pack(fill="both", expand=True, padx=14, pady=(10, 12))
 
-        top = ttk.Frame(outer)
-        top.pack(fill="x")
-        self.drive_label = ttk.Label(top, text="正在读取磁盘信息 ...")
-        self.drive_label.pack(side="left")
-        ttk.Label(top, text="v" + __version__, foreground="#888").pack(side="right")
+        # --- 顶部仪表盘：标题、版本、磁盘读数
+        self.head = tk.Canvas(pad, height=self._head_h, bg=BG,
+                              highlightthickness=0, bd=0)
+        self.head.pack(fill="x")
+        self.head.bind("<Configure>", self._on_head_resize)
 
-        bar = ttk.Frame(outer)
-        bar.pack(fill="x", pady=(8, 6))
-        self.btn_scan = ttk.Button(bar, text="扫描", width=10, command=self.on_scan)
+        # --- 操作条
+        bar = tk.Frame(pad, bg=BG)
+        bar.pack(fill="x", pady=(13, 10))
+
+        self.btn_scan = NeonButton(bar, "SCAN · 扫描", self.on_scan,
+                                   width=140, height=36, color=CYAN)
         self.btn_scan.pack(side="left")
-        self.btn_clean = ttk.Button(bar, text="清理选中项", width=14,
-                                    command=self.on_clean, state="disabled")
-        self.btn_clean.pack(side="left", padx=(6, 0))
-        self.btn_all = ttk.Button(bar, text="全选", width=8,
-                                  command=self.on_check_all)
-        self.btn_all.pack(side="left", padx=(14, 0))
-        self.btn_none = ttk.Button(bar, text="全不选", width=8,
-                                   command=self.on_check_none)
-        self.btn_none.pack(side="left", padx=(4, 0))
 
-        ttk.Label(bar, text="   删除方式:").pack(side="left", padx=(14, 2))
-        ttk.Radiobutton(bar, text="永久删除", value=False,
-                        variable=self.use_recyclebin).pack(side="left")
-        ttk.Radiobutton(bar, text="送回收站", value=True,
-                        variable=self.use_recyclebin).pack(side="left", padx=(6, 0))
+        self.btn_clean = NeonButton(bar, "PURGE · 清理选中项", self.on_clean,
+                                    width=182, height=36, color=MAGENTA)
+        self.btn_clean.pack(side="left", padx=(8, 0))
+        self.btn_clean.set_state("disabled")
 
-        self.nb = ttk.Notebook(outer)
-        self.nb.pack(fill="both", expand=True)
+        tk.Frame(bar, bg=BORDER, width=1, height=24).pack(side="left", padx=15)
+
+        self.btn_all = NeonButton(bar, "ALL", self.on_check_all,
+                                  width=82, height=36, color=PURPLE)
+        self.btn_all.pack(side="left")
+        self.btn_none = NeonButton(bar, "NONE", self.on_check_none,
+                                   width=82, height=36, color=PURPLE)
+        self.btn_none.pack(side="left", padx=(8, 0))
+
+        tk.Frame(bar, bg=BORDER, width=1, height=24).pack(side="left", padx=15)
+
+        tk.Label(bar, text="删除方式", bg=BG, fg=TEXT_DIM,
+                 font=(FONT_UI, 9)).pack(side="left", padx=(0, 10))
+        NeonRadio(bar, "永久删除", self.use_recyclebin, False,
+                  color=MAGENTA).pack(side="left")
+        NeonRadio(bar, "送回收站", self.use_recyclebin, True,
+                  color=CYAN).pack(side="left", padx=(14, 0))
+
+        # --- 主体（先创建不 pack，pack 顺序见本节末尾）
+        self.nb = ttk.Notebook(pad, style="Cyber.TNotebook")
         self._build_targets_tab()
         self._build_empty_tab()
 
-        log_head = ttk.Frame(outer)
-        log_head.pack(fill="x", pady=(8, 2))
-        ttk.Label(log_head, text="日志").pack(side="left")
-        ttk.Button(log_head, text="清空日志", width=8,
-                   command=lambda: self.log_text.delete("1.0", "end")).pack(side="right")
+        # --- 日志
+        log_head = tk.Frame(pad, bg=BG)
+        tk.Frame(log_head, bg=CYAN, width=3, height=14).pack(side="left")
+        tk.Label(log_head, text="LOG // 运行日志", bg=BG, fg=CYAN,
+                 font=(FONT_EN, 10, "bold")).pack(side="left", padx=(8, 0))
+        NeonButton(log_head, "CLR", lambda: self.log_text.delete("1.0", "end"),
+                   width=66, height=24, color=TEXT_DIM,
+                   font=(FONT_EN, 9, "bold")).pack(side="right")
 
-        logf = ttk.Frame(outer)
-        logf.pack(fill="both", expand=False)
-        self.log_text = tk.Text(logf, height=8, wrap="none",
-                                font=("Consolas", 9), relief="solid", borderwidth=1)
-        sb = ttk.Scrollbar(logf, orient="vertical", command=self.log_text.yview)
+        logf = tk.Frame(pad, bg=BG)
+        self.log_text = tk.Text(
+            logf, height=6, wrap="none", font=(FONT_EN, 9),
+            bg=BG_DEEP, fg=TEXT, insertbackground=CYAN, relief="flat",
+            borderwidth=0, padx=9, pady=6,
+            selectbackground="#10465c", selectforeground="#ffffff",
+            inactiveselectbackground="#10465c",
+            highlightthickness=1, highlightbackground=BORDER,
+            highlightcolor=BORDER_HI)
+        sb = ttk.Scrollbar(logf, orient="vertical", command=self.log_text.yview,
+                           style="Cyber.Vertical.TScrollbar")
         self.log_text.configure(yscrollcommand=sb.set)
         self.log_text.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
 
-        self.status = ttk.Label(outer, text="就绪")
-        self.status.pack(anchor="w", pady=(6, 0))
+        # --- 状态条
+        statusbar = tk.Frame(pad, bg=PANEL, highlightthickness=1,
+                             highlightbackground=BORDER)
+        self._status_accent = tk.Frame(statusbar, bg=CYAN, width=3)
+        self._status_accent.pack(side="left", fill="y")
+        self.status = tk.Label(statusbar, text="就绪", bg=PANEL, fg=CYAN,
+                               font=(FONT_UI, 9), anchor="w", padx=10, pady=6)
+        self.status.pack(side="left", fill="x", expand=True)
+
+        # --- 布局顺序：pack 按调用顺序分配空间，先来的先拿到固定高度。
+        # 日志与状态条用 side="bottom" 自下而上贴边，Notebook 最后 pack 吃剩余空间。
+        # 顺序反了的话，窗口不够高时状态条会被 expand 的 Notebook 整个挤没。
+        statusbar.pack(side="bottom", fill="x", pady=(9, 0))
+        logf.pack(side="bottom", fill="x")
+        log_head.pack(side="bottom", fill="x", pady=(13, 5))
+        self.nb.pack(side="top", fill="both", expand=True)
+
+        self.root.after(30, self._draw_head)
+
+    # ---------------- 顶部仪表盘绘制 ----------------
+
+    def _on_head_resize(self, event):
+        if abs(event.width - self._head_w) < 2:
+            return
+        self._head_w = event.width
+        self._draw_head()
+
+    def _draw_head(self):
+        w = self._head_w or self.head.winfo_width()
+        if w < 40:
+            return
+        h = self._head_h
+        self.head.delete("all")
+
+        # 网格底纹：只画竖线，横线会正好穿过标题区的几行字
+        for x in range(0, w + 24, 24):
+            self.head.create_line(x, 0, x, h, fill=GRID, tags="grid")
+        self.head.tag_lower("grid")
+
+        self.head.create_rectangle(0, 14, 3, h - 24, fill=CYAN, outline="")
+        self._blink = self.head.create_rectangle(14, 16, 23, 31, fill=CYAN,
+                                                 outline="")
+
+        # 标题：先画一层暗色副本做假阴影
+        self.head.create_text(31, 25, text="CDISK//CLEANER", anchor="w",
+                              fill=_mix(CYAN, 0.30), font=(FONT_EN, 20, "bold"))
+        self.head.create_text(30, 23, text="CDISK//CLEANER", anchor="w",
+                              fill=CYAN, font=(FONT_EN, 20, "bold"))
+
+        self.head.create_text(w - 2, 19, text="v" + __version__, anchor="e",
+                              fill=MAGENTA, font=(FONT_EN, 11, "bold"))
+        self.head.create_text(w - 2, 37, text="WHITELIST MODE · 白名单制",
+                              anchor="e", fill=TEXT_DIM, font=(FONT_EN, 8))
+
+        self.head.create_text(14, 48, anchor="w", fill=TEXT_DIM,
+                              font=(FONT_UI, 9),
+                              text="只清理人工审核过的目标，清单之外的路径一律不碰")
+
+        # 磁盘读数（动态更新，见 _refresh_drive_info）
+        self._drive_item = self.head.create_text(
+            14, 70, anchor="w", text="正在读取磁盘信息 ...", fill=GREEN,
+            font=(FONT_EN, 13, "bold"))
+        self._drive_sub = self.head.create_text(
+            196, 72, anchor="w", text="", fill=TEXT_DIM, font=(FONT_UI, 9))
+        self._drive_others = self.head.create_text(
+            w - 2, 72, anchor="e", text="", fill=TEXT_DIM, font=(FONT_EN, 9))
+
+        # 底部霓虹分割线
+        self.head.create_line(0, h - 2, w, h - 2, fill=BORDER)
+        self.head.create_line(0, h - 2, w * 0.34, h - 2, fill=CYAN, width=2)
+        self.head.create_line(w - 78, h - 2, w, h - 2, fill=MAGENTA, width=2)
+
+        self._refresh_drive_info()
+
+    def _tick_blink(self):
+        """标题旁的小方块来回变色，让界面看起来「在工作」。"""
+        if not self.alive:
+            return
+        self._blink_on = not self._blink_on
+        try:
+            self.head.itemconfigure(self._blink,
+                                    fill=CYAN if self._blink_on else "#0d3b47")
+        except Exception:
+            pass
+        self.root.after(620, self._tick_blink)
 
     def _build_targets_tab(self):
         from tkinter import ttk
 
-        frame = ttk.Frame(self.nb)
+        frame = tk.Frame(self.nb, bg=PANEL)
         self.nb.add(frame, text="垃圾与临时文件")
 
         cols = ("chk", "name", "size", "count", "note")
         self.tree = ttk.Treeview(frame, columns=cols, show="headings",
-                                 selectmode="browse")
+                                 selectmode="browse", style="Cyber.Treeview")
         for cid, text, width, anchor, stretch in (
-                ("chk", "", 32, "center", False),
-                ("name", "项目", 170, "w", False),
-                ("size", "大小", 90, "e", False),
-                ("count", "文件数", 80, "e", False),
+                ("chk", "", 34, "center", False),
+                ("name", "项目", 178, "w", False),
+                ("size", "大小", 96, "e", False),
+                ("count", "文件数", 94, "e", False),
                 ("note", "说明", 480, "w", True)):
-            self.tree.heading(cid, text=text)
+            self.tree.heading(cid, text=text, anchor=anchor)
             self.tree.column(cid, width=width, anchor=anchor, stretch=stretch)
 
-        self.tree.tag_configure("risky", foreground="#b26a00")
-        self.tree.tag_configure("missing", foreground="#aaaaaa")
-        self.tree.tag_configure("admin", foreground="#00558c")
+        self.tree.tag_configure("risky", foreground=AMBER)
+        self.tree.tag_configure("missing", foreground=TEXT_OFF)
+        self.tree.tag_configure("admin", foreground="#22b8d8")
 
-        sb = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
+        sb = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview,
+                           style="Cyber.Vertical.TScrollbar")
         self.tree.configure(yscrollcommand=sb.set)
-        self.tree.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
+        self.tree.pack(side="left", fill="both", expand=True,
+                       padx=(1, 0), pady=1)
+        sb.pack(side="right", fill="y", padx=(0, 1), pady=1)
 
         self.tree.bind("<Button-1>", self._on_tree_click)
         self.tree.bind("<space>",
@@ -951,36 +1421,45 @@ class CleanerApp(object):
     def _build_empty_tab(self):
         from tkinter import ttk
 
-        frame = ttk.Frame(self.nb)
+        frame = tk.Frame(self.nb, bg=PANEL)
         self.nb.add(frame, text="空文件夹")
 
-        ttk.Label(
-            frame, justify="left", wraplength=840, foreground="#555",
-            text="空文件夹默认不勾选。系统目录（Windows、Program Files、AppData、"
-                 "回收站等）已强制排除，根本不参与扫描。"
+        tip = tk.Frame(frame, bg=PANEL)
+        tip.pack(fill="x", padx=10, pady=(11, 8))
+        tk.Frame(tip, bg=AMBER, width=3, height=36).pack(side="left")
+        tk.Label(
+            tip, bg=PANEL, fg=TEXT_DIM, font=(FONT_UI, 9), justify="left",
+            wraplength=850,
+            text="空文件夹默认不勾选。系统目录（Windows、Program Files、"
+                 "AppData、回收站等）已强制排除，根本不参与扫描。\n"
                  "提示：这一项收益有限——一个空目录在 NTFS 上只占几 KB。"
-        ).pack(anchor="w", padx=6, pady=(6, 4))
+        ).pack(side="left", padx=(9, 0))
 
-        holder = ttk.Frame(frame)
-        holder.pack(fill="both", expand=True)
+        # 按钮要排在表格之前 pack：表格 expand 会吃掉全部剩余高度，
+        # 排在后面的控件在空间不够时会被整个裁掉。
+        self.btn_scan_empty = NeonButton(frame, "SCAN · 空目录",
+                                         self.on_scan_empty, width=152,
+                                         height=34, color=GREEN)
+        self.btn_scan_empty.pack(anchor="w", padx=10, pady=(0, 9))
+
+        holder = tk.Frame(frame, bg=PANEL)
+        holder.pack(fill="both", expand=True, padx=1, pady=(0, 9))
         cols = ("chk", "path")
         self.etree = ttk.Treeview(holder, columns=cols, show="headings",
-                                  selectmode="extended")
-        self.etree.heading("chk", text="")
-        self.etree.heading("path", text="路径")
-        self.etree.column("chk", width=32, anchor="center", stretch=False)
-        self.etree.column("path", width=740, anchor="w", stretch=True)
+                                  selectmode="extended", style="Cyber.Treeview")
+        self.etree.heading("chk", text="", anchor="center")
+        self.etree.heading("path", text="路径", anchor="w")
+        self.etree.column("chk", width=34, anchor="center", stretch=False)
+        self.etree.column("path", width=800, anchor="w", stretch=True)
 
-        sb = ttk.Scrollbar(holder, orient="vertical", command=self.etree.yview)
+        sb = ttk.Scrollbar(holder, orient="vertical", command=self.etree.yview,
+                           style="Cyber.Vertical.TScrollbar")
         self.etree.configure(yscrollcommand=sb.set)
         self.etree.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
 
         self.etree.bind("<Button-1>", self._on_etree_click)
         self.etree.bind("<space>", self._on_etree_space)
-
-        ttk.Button(frame, text="扫描空文件夹", width=14,
-                   command=self.on_scan_empty).pack(anchor="w", pady=(6, 4))
 
     # ---------------- 行数据 ----------------
 
@@ -1008,20 +1487,37 @@ class CleanerApp(object):
     # ---------------- 日志与状态 ----------------
 
     def log(self, msg):
-        self.log_text.insert("end", "[%s] %s\n" % (time.strftime("%H:%M:%S"), msg))
+        self.log_text.insert("end", "%s > %s\n" % (time.strftime("%H:%M:%S"), msg))
         self.log_text.see("end")
 
     def set_status(self, text):
         self.status.configure(text=text)
 
     def _refresh_drive_info(self):
-        info = []
-        for letter in "CDEF":
+        # 仪表盘可能还没绘制（首帧），等 _draw_head 完成时会再调一次
+        if self._drive_item is None:
+            return
+
+        u0 = disk_usage("C")
+        if u0:
+            used_pct = u0[1] * 100.0 / max(u0[0], 1)
+            color = GREEN if used_pct < 85 else (AMBER if used_pct < 93 else MAGENTA)
+            self.head.itemconfigure(self._drive_item, fill=color,
+                                    text="C: 可用 %s" % human_size(u0[2]))
+            self.head.itemconfigure(
+                self._drive_sub,
+                text="/ 共 %s   ·   已用 %.0f%%" % (human_size(u0[0]), used_pct))
+        else:
+            self.head.itemconfigure(self._drive_item, fill=TEXT_DIM,
+                                    text="未读取到磁盘信息")
+            self.head.itemconfigure(self._drive_sub, text="")
+
+        others = []
+        for letter in "DEF":
             u = disk_usage(letter)
             if u:
-                info.append("%s: 可用 %s / 共 %s"
-                            % (letter, human_size(u[2]), human_size(u[0])))
-        self.drive_label.configure(text="    ".join(info) or "未读取到磁盘信息")
+                others.append("%s: 可用 %s" % (letter, human_size(u[2])))
+        self.head.itemconfigure(self._drive_others, text="   ".join(others))
 
     # ---------------- 勾选 ----------------
 
@@ -1133,8 +1629,8 @@ class CleanerApp(object):
         if self.empty_checked:
             parts.append("外加 %d 个空文件夹" % len(self.empty_checked))
         self.set_status("    ".join(parts))
-        self.btn_clean.configure(
-            state="disabled" if self.busy or not (sel or self.empty_checked)
+        self.btn_clean.set_state(
+            "disabled" if self.busy or not (sel or self.empty_checked)
             else "normal")
 
     # ---------------- 扫描 ----------------
@@ -1142,11 +1638,20 @@ class CleanerApp(object):
     def _set_busy(self, busy):
         self.busy = busy
         state = "disabled" if busy else "normal"
-        for w in (self.btn_scan, self.btn_all, self.btn_none):
-            w.configure(state=state)
-        self.btn_clean.configure(
-            state="disabled" if busy or not (self._selected_targets()
-                                             or self.empty_checked) else "normal")
+        for w in (self.btn_scan, self.btn_all, self.btn_none,
+                  self.btn_scan_empty):
+            w.set_state(state)
+        self.btn_clean.set_state(
+            "disabled" if busy or not (self._selected_targets()
+                                       or self.empty_checked) else "normal")
+        self._touch_status_accent(busy)
+
+    def _touch_status_accent(self, busy):
+        """忙的时候把状态条左侧的色条点亮，给个一眼可见的运行提示。"""
+        try:
+            self._status_accent.configure(bg=MAGENTA if busy else CYAN)
+        except Exception:
+            pass
 
     def on_scan(self):
         if self.busy:

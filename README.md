@@ -6,6 +6,10 @@ Windows 上一键清理 C 盘垃圾、临时文件和空文件夹的小工具。
 只清清单里的东西，清单之外的一律不碰。
 
 ![界面](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)
+![界面](screenshot.png)
+
+> 图为示例数据。实际运行时这一栏的数字取决于你机器上的情况。
+
 ![语言](https://img.shields.io/badge/python-3.8%2B-green)
 ![依赖](https://img.shields.io/badge/dependencies-none-brightgreen)
 
@@ -88,6 +92,18 @@ python cdisk_cleaner.py
 
 如果你看到这一栏里没几个项目，那是正常的，也是对的。
 
+## 自检
+
+仓库带了一份回归自检，覆盖路径守卫的拦截与放行、扫描/清理的端到端流程，
+以及界面组件的接口：
+
+```bash
+python selftest.py
+```
+
+其中「必须拦住」那一组是安全底线——`System32`、`Program Files`、用户文档、
+盘符根目录等都必须被拒绝。改动守卫相关代码后请先跑这个。
+
 ## 打包成 exe
 
 仓库里带了打包脚本，版本号、图标、版本资源都只有一个来源：
@@ -108,9 +124,16 @@ python build_exe.py
 
 ## 实现要点
 
-- **界面**：tkinter，扫描与清理都在后台线程跑，通过队列回传进度，界面不会卡住。
-- **回收站大小**：走 `SHQueryRecycleBin` API 查询，不遍历文件系统——
-  本机回收站有十几万项，遍历一次要好几十秒，用 API 是毫秒级。
+- **界面**：tkinter。配色是自绘出来的——ttk 先切到 `clam` 主题（Windows 原生主题
+  不接受颜色覆盖），再逐项染色；按钮和单选按钮用 Canvas 画切角描边，
+  所以看起来不太像原生控件。
+- **深色标题栏**：调 `DwmSetWindowAttribute(DWMWA_USE_IMMERSIVE_DARK_MODE)`。
+  必须用 `GetParent(winfo_id())` 取顶层窗口句柄——`winfo_id()` 给的是 Tk 的内层窗口，
+  拿它调用一律返回 `E_HANDLE`。另外 Win10 的部分环境（远程会话、禁用 DWM 合成）
+  不会渲染这个属性，调用会返回成功但外观不变，属于系统行为。
+- **回收站大小**：直接遍历 `$Recycle.Bin`，**不用** `SHQueryRecycleBin`。
+  本机回收站有 16 万项时那个 API 要跑 50 秒（它会逐个解析 `$I` 元数据），
+  改成遍历只要 6 秒。这项统计在单独线程跑，不拖住其他不到 1 秒的项目。
 - **送回收站**：`SHFileOperationW` + `FOF_ALLOWUNDO`，一次调用处理整批。
 - **删除只读文件**：先用 `os.chmod` 去掉只读位再删。
 - **被占用的文件**：跳过并计数，不会中断整个流程。

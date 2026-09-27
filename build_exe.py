@@ -187,6 +187,10 @@ def main():
         "--onedir" if args.onedir else "--onefile",
         "--name", APP_NAME,
         "--icon", icon,
+        # 也把图标打进包内，主程序启动时用它设窗口/任务栏图标。
+        # 只给 --icon 的话，那只是 exe 的文件图标资源，窗口拿不到。
+        # 必须用绝对路径：--specpath 指向 build/，相对路径会按 spec 的位置解析。
+        "--add-data", os.path.join(here(), ICON_FILE) + os.pathsep + ".",
         "--version-file", vfile,
         "--distpath", DIST_DIR,
         "--workpath", BUILD_DIR,

@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-程序化生成图标：垃圾桶主题。
+程序化生成图标：赛博朋克垃圾桶。
 
-思路与 monitor-brightness 一致——在 8 倍分辨率上绘制，再用 LANCZOS 缩小，
-边缘比直接在小画布上画干净得多。16/20px 会退化，所以单独用简化造型。
+配色和界面共用一套：近黑底 + 霓虹青描边 + 品红点缀。
+在 8 倍分辨率上绘制再 LANCZOS 缩小，边缘比直接画小图干净得多；
+16/20px 会糊，所以单独给一套加粗的简化造型。
 
 直接运行本脚本会生成 icon.ico；build_exe.py 也会调用它。
 """
@@ -17,10 +18,19 @@ SS = 8                        # 超采样倍数
 SIZES = [16, 20, 24, 32, 48, 64, 128, 256]
 OUT = "icon.ico"
 
-BG = (30, 41, 59, 255)        # 深蓝灰底
-BODY = (230, 237, 243, 255)   # 桶身近白
-LID = (148, 163, 184, 255)    # 桶盖浅灰
-ACCENT = (52, 211, 153, 255)  # 点缀青绿
+BG = (6, 10, 17, 255)         # 近黑底，和界面 BG 一致
+DEEP = (6, 16, 24, 255)       # 桶身内部
+NEON = (0, 229, 255, 255)     # 主霓虹青
+MAGENTA = (255, 45, 149, 255)  # 强调品红
+DIM = (11, 109, 128, 255)     # 暗青
+GLOW = (0, 120, 145, 110)     # 外发光（半透明）
+
+
+def _cut_square(S, pad, cut):
+    """切角方形的顶点，切左上与右下——和界面里的按钮同一套语言。"""
+    x0, y0, x1, y1 = pad, pad, S - 1 - pad, S - 1 - pad
+    return [(x0 + cut, y0), (x1, y0), (x1, y1 - cut),
+            (x1 - cut, y1), (x0, y1), (x0, y0 + cut)]
 
 
 def draw_icon(size):
@@ -29,45 +39,52 @@ def draw_icon(size):
     img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
 
-    d.rounded_rectangle([0, 0, S - 1, S - 1], radius=int(S * 0.22), fill=BG)
+    pad = int(S * 0.02)
+    cut = int(S * 0.20)
 
     if size <= 20:
-        # 小尺寸：只留盖和桶身，并把比例放大，否则缩完糊成一个方块
-        d.rectangle([int(S * 0.14), int(S * 0.28),
-                     int(S * 0.86), int(S * 0.40)], fill=LID)
-        d.polygon([(int(S * 0.19), int(S * 0.45)),
-                   (int(S * 0.81), int(S * 0.45)),
-                   (int(S * 0.72), int(S * 0.88)),
-                   (int(S * 0.28), int(S * 0.88))], fill=BODY)
+        # 小尺寸：不画外发光（缩完只会糊成一坨），
+        # 盖要明显比桶宽、中间留缝，否则整体会合并成一个方块
+        d.polygon(_cut_square(S, pad, cut), fill=BG, outline=NEON,
+                  width=max(1, int(S * 0.020)))
+        d.rectangle([int(S * 0.18), int(S * 0.26),
+                     int(S * 0.82), int(S * 0.375)], fill=NEON)
+        d.polygon([(int(S * 0.29), int(S * 0.47)),
+                   (int(S * 0.71), int(S * 0.47)),
+                   (int(S * 0.62), int(S * 0.83)),
+                   (int(S * 0.38), int(S * 0.83))], fill=NEON)
         return img.resize((size, size), Image.LANCZOS)
 
-    # ---- 提手 ----
-    d.rounded_rectangle([int(S * 0.43), int(S * 0.17),
-                         int(S * 0.57), int(S * 0.26)],
-                        radius=int(S * 0.02), fill=LID)
+    # 外发光：比主体大一圈的半透明青，缩小时自然晕开
+    d.polygon(_cut_square(S, -int(S * 0.03), cut + int(S * 0.03)), fill=GLOW)
+    d.polygon(_cut_square(S, pad, cut), fill=BG, outline=NEON,
+              width=max(1, int(S * 0.016)))
 
-    # ---- 桶盖 ----
-    d.rounded_rectangle([int(S * 0.20), int(S * 0.25),
-                         int(S * 0.80), int(S * 0.33)],
-                        radius=int(S * 0.025), fill=LID)
+    stroke = max(1, int(S * 0.022))
 
-    # ---- 桶身（梯形，上宽下窄）----
-    d.polygon([(int(S * 0.24), int(S * 0.37)),
-               (int(S * 0.76), int(S * 0.37)),
-               (int(S * 0.69), int(S * 0.80)),
-               (int(S * 0.31), int(S * 0.80))], fill=BODY)
+    # 提手
+    d.rectangle([int(S * 0.41), int(S * 0.15),
+                 int(S * 0.59), int(S * 0.25)], outline=DIM, width=stroke)
 
-    # ---- 桶身竖纹（挖出底色，形成镂空感）----
-    for cx in (0.40, 0.50, 0.60):
-        half = int(S * 0.018)
-        c = int(S * cx)
-        d.polygon([(c - half, int(S * 0.45)), (c + half, int(S * 0.45)),
-                   (c + half, int(S * 0.72)), (c - half, int(S * 0.72))],
-                  fill=BG)
+    # 桶盖：实心青条，中间压一道暗缝
+    d.rectangle([int(S * 0.17), int(S * 0.26),
+                 int(S * 0.83), int(S * 0.35)], fill=NEON)
+    d.rectangle([int(S * 0.17), int(S * 0.298),
+                 int(S * 0.83), int(S * 0.316)], fill=DEEP)
 
-    # ---- 右下角一点青绿，避免整体太素 ----
-    d.ellipse([int(S * 0.70), int(S * 0.70),
-               int(S * 0.86), int(S * 0.86)], fill=ACCENT)
+    # 桶身：描边梯形
+    d.polygon([(int(S * 0.24), int(S * 0.39)),
+               (int(S * 0.76), int(S * 0.39)),
+               (int(S * 0.68), int(S * 0.84)),
+               (int(S * 0.32), int(S * 0.84))],
+              fill=DEEP, outline=NEON, width=stroke)
+
+    # 桶内三条数据线，中间那条用品红点一下
+    for cx, col in ((0.40, NEON), (0.50, MAGENTA), (0.60, NEON)):
+        c = S * cx
+        hw = S * 0.017
+        d.polygon([(c - hw, S * 0.47), (c + hw, S * 0.47),
+                   (c + hw, S * 0.75), (c - hw, S * 0.75)], fill=col)
 
     return img.resize((size, size), Image.LANCZOS)
 
