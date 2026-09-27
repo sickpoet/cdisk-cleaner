@@ -2,6 +2,9 @@
 """
 回归自检：路径守卫、扫描与清理、界面组件。
 
+Copyright (C) 2026 柯夜 (sickpoet). 保留所有权利。
+源码：https://github.com/sickpoet/cdisk-cleaner
+
     python selftest.py
 
 「必须拦住」那一组是安全底线，任何一条挂掉都说明守卫被动坏了，
@@ -183,6 +186,35 @@ except OSError as exc:
 finally:
     C._rmtree_force(sandbox)
     check("清理测试目录", not os.path.exists(sandbox))
+
+print("\n=== 署名与出处 ===")
+# 这组是防篡改的：署名被人抹掉或改掉，这里立刻红。
+check("__author__ 是柯夜", C.__author__ == "柯夜", C.__author__)
+check("__author_id__ 是 sickpoet", C.__author_id__ == "sickpoet",
+      C.__author_id__)
+check("版权串含作者名",
+      bool(C.__copyright__) and C.__author__ in C.__copyright__,
+      C.__copyright__)
+check("主页指向原仓库",
+      "github.com/sickpoet/cdisk-cleaner" in C.__homepage__, C.__homepage__)
+check("指纹非空", bool(C.FINGERPRINT), C.FINGERPRINT)
+
+# 模块文档字符串里嵌的零宽水印。整段复制源码时它会跟着走，
+# 用来在抄袭发生后追溯出处。编码：U+200B=1 / U+200C=0 / U+200D=分隔。
+_zw = [c for c in (C.__doc__ or "") if c in "\u200b\u200c\u200d"]
+_wm_bits, _wm = "", []
+for _c in _zw:
+    if _c == "\u200d":
+        if _wm_bits:
+            _wm.append(chr(int(_wm_bits, 2)))
+        _wm_bits = ""
+    else:
+        _wm_bits += "1" if _c == "\u200b" else "0"
+_wm = "".join(_wm)
+check("源码水印可解码且含作者标识",
+      "柯夜" in _wm and "sickpoet" in _wm, _wm or "（没找到水印）")
+if _wm:
+    print("       水印明文: %s" % _wm)
 
 def _finish():
     """结算并退出。提出来是为了让 --no-gui 能在界面用例之前就收工。"""

@@ -2,6 +2,9 @@
 """
 一键打包成 exe。
 
+Copyright (C) 2026 柯夜 (sickpoet). 保留所有权利。
+源码：https://github.com/sickpoet/cdisk-cleaner
+
 做四件事：
   1. 从主程序读 __version__（版本号的唯一来源，别在别处硬编码）
   2. 生成图标（调用 make_icon.py）
@@ -27,7 +30,12 @@ import sys
 
 APP_NAME = "cdisk-cleaner"
 DISPLAY_NAME = "C 盘垃圾清理器"
-COMPANY = "sickpoet"
+# exe 文件属性里显示的公司与版权。文件名保持 ASCII，中文只出现在字符串里。
+COMPANY = "柯夜"
+AUTHOR_ID = "sickpoet"      # GitHub 账号，写进文件属性「备注」
+HOMEPAGE = "https://github.com/sickpoet/cdisk-cleaner"
+COPYRIGHT_HOLDER = "%s (%s)" % (COMPANY, AUTHOR_ID)
+COMMENT = "作者 %s · %s" % (COPYRIGHT_HOLDER, HOMEPAGE)
 MAIN_SCRIPT = "cdisk_cleaner.py"
 ICON_FILE = "icon.ico"
 VERSION_FILE = "version_info.txt"
@@ -49,11 +57,12 @@ VSVersionInfo(
   kids=[
     StringFileInfo([
       StringTable('080404b0', [
+        StringStruct('Comments', '%(comment)s'),
         StringStruct('CompanyName', '%(company)s'),
         StringStruct('FileDescription', '%(display)s'),
         StringStruct('FileVersion', '%(version)s'),
         StringStruct('InternalName', '%(name)s'),
-        StringStruct('LegalCopyright', 'Copyright (C) 2026 %(company)s'),
+        StringStruct('LegalCopyright', 'Copyright (C) 2026 %(holder)s'),
         StringStruct('OriginalFilename', '%(name)s.exe'),
         StringStruct('ProductName', '%(display)s'),
         StringStruct('ProductVersion', '%(version)s')
@@ -120,6 +129,8 @@ def write_version_file(version):
         "display": DISPLAY_NAME,
         "name": APP_NAME,
         "company": COMPANY,
+        "holder": COPYRIGHT_HOLDER,
+        "comment": COMMENT,
     }
     path = os.path.join(here(), VERSION_FILE)
     with open(path, "w", encoding="utf-8") as fh:
@@ -195,7 +206,9 @@ def main():
     check_tkinter()
     version = read_version()
 
-    print("%s  v%s" % (DISPLAY_NAME, version))
+    print("%s  v%s   ·   %s (%s)" % (DISPLAY_NAME, version,
+                                     COMPANY, AUTHOR_ID))
+    print("      出处  : %s" % HOMEPAGE)
     print("      解释器: %s" % sys.executable)
     print("      模式  : %s" % ("目录版" if args.onedir else "单文件版"))
 

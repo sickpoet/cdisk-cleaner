@@ -13,10 +13,25 @@ C 盘垃圾清理器
 4. 空目录单列：默认不勾选，且强制跳过系统保护区。
 
 只用标准库，零第三方依赖。
+
+作者：柯夜（GitHub: sickpoet）
+版权：Copyright (C) 2026 柯夜。保留所有权利。
+源码：https://github.com/sickpoet/cdisk-cleaner
+‌‌‌‌‌‌‌‌‌​‌‌​‌​​‍‌‌‌‌‌‌‌‌‌​‌‌‌​‌​‍‌‌‌‌‌‌‌‌‌​‌​​‌‌​‍‌‌‌‌‌‌‌‌‌​‌‌‌​‌​‍‌‌‌‌‌‌‌‌‌‌​‌​​‌​‍‌‌‌‌‌‌‌‌‌​‌‌‌‌​​‍‌‌‌‌‌‌‌‌‌​‌‌‌​‌‌‍‌‌‌‌‌‌‌‌‌​‌‌​‌‌​‍‌‌‌‌‌‌‌‌‌​‌​‌‌​​‍‌‌‌‌‌‌‌‌‌​‌‌​‌​​‍‌‌‌‌‌‌‌‌‌‌​‌‌‌‌‌‍‌‌‌‌‌‌‌‌‌​​‌‌‌​​‍‌‌‌‌‌‌‌‌‌​​‌‌​‌‌‍‌‌‌‌‌‌‌‌‌​​‌​‌‌​‍‌‌‌‌‌‌‌‌‌​​​‌‌​​‍‌‌‌‌‌‌‌‌‌​​‌​‌​​‍‌‌‌‌‌‌‌‌‌‌​‌​​‌​‍‌‌‌‌‌‌‌‌‌​​‌‌‌​​‍‌‌‌‌‌‌‌‌‌​​‌​​‌‌‍‌‌‌‌‌‌‌‌‌​​‌‌​‌​‍‌‌‌‌‌‌‌‌‌​​‌‌‌‌​‍‌‌‌‌‌‌‌‌‌​​‌​​​‌‍‌‌‌‌‌‌‌‌‌​​‌‌​‌​‍‌‌‌‌‌‌‌‌‌​​​‌‌​‌‍‌‌‌‌‌‌‌‌‌‌​‌‌‌‌‌‍‌‌‌‌‌‌‌‌‌​​‌‌‌​‌‍‌‌‌‌‌‌‌‌‌​​​​‌‌​‍‌‌‌‌‌‌‌‌‌‌​‌‌‌‌‌‍‌​​‌‌​​​​​​‌​​​​‍‌​‌​​‌‌​‌‌‌​​​‌‌‍‌‌‌‌‌‌‌‌‌‌​‌‌‌‌‌‍‌‌‌‌‌‌‌‌‌‌​‌​‌‌‌‍‌‌‌‌‌‌‌‌‌​​​‌‌​​‍‌‌‌‌‌‌‌‌‌​​‌​‌‌​‍‌‌‌‌‌‌‌‌‌​​‌‌‌​​‍‌‌‌‌‌‌‌‌‌​​‌​‌​​‍‌‌‌‌‌‌‌‌‌​​​‌‌‌‌‍‌‌‌‌‌‌‌‌‌​​‌​​​​‍‌‌‌‌‌‌‌‌‌​​‌‌​‌​‍‌‌‌‌‌‌‌‌‌​​​‌​‌‌‍‌‌‌‌‌‌‌‌‌‌​‌​‌‌​‍
+
 """
 
-__version__ = "1.2.1"
+__version__ = "1.2.2"
+__author__ = "柯夜"
+__author_id__ = "sickpoet"
+__copyright__ = "Copyright (C) 2026 柯夜 (sickpoet). 保留所有权利。"
+__homepage__ = "https://github.com/sickpoet/cdisk-cleaner"
 APP_NAME = "C 盘垃圾清理器"
+
+# 出处指纹：同一串同时写进 exe 文件属性、启动日志与「关于」对话框，
+# 用来证明这份程序出自上述仓库。
+FINGERPRINT = "KEYE-CDISK-7F3A91-2026"
+SIGN_LINE = "柯夜 原创 · 盗用必究"
 
 import ctypes
 import glob
@@ -1217,7 +1232,8 @@ class CleanerApp(object):
 
         pick_fonts(root)
         _set_window_icon(root)
-        root.title("%s  ::  v%s" % (APP_NAME, __version__))
+        root.title("%s  v%s   ·   by %s" % (APP_NAME, __version__,
+                                              __author__))
         # 根窗口底色当窗口外框用：内容区四周留 1px 露出它
         root.configure(bg=BORDER_HI)
         root.geometry("1000x772")
@@ -1250,6 +1266,7 @@ class CleanerApp(object):
             apply_dark_titlebar(root)
         self._build_ui()
         self._refresh_drive_info()
+        self._log_banner()
         self.log("就绪。扫描过程只读，不会删任何东西。")
         if not is_admin():
             self.log("当前非管理员权限：「系统临时文件」「Windows 更新缓存」"
@@ -1338,10 +1355,13 @@ class CleanerApp(object):
         NeonButton(log_head, "CLR", lambda: self.log_text.delete("1.0", "end"),
                    width=66, height=24, color=TEXT_DIM,
                    font=(FONT_EN, 9, "bold")).pack(side="right")
+        NeonButton(log_head, "ABOUT", lambda: self._show_about(),
+                   width=74, height=24, color=AMBER,
+                   font=(FONT_EN, 9, "bold")).pack(side="right", padx=(0, 6))
 
         logf = tk.Frame(body, bg=BG)
         self.log_text = tk.Text(
-            logf, height=6, wrap="none", font=(FONT_EN, 9),
+            logf, height=8, wrap="none", font=(FONT_EN, 9),
             bg=BG_DEEP, fg=TEXT, insertbackground=CYAN, relief="flat",
             borderwidth=0, padx=9, pady=6,
             selectbackground="#10465c", selectforeground="#ffffff",
@@ -1362,6 +1382,13 @@ class CleanerApp(object):
         self.status = tk.Label(statusbar, text="就绪", bg=PANEL, fg=CYAN,
                                font=(FONT_UI, 9), anchor="w", padx=10, pady=6)
         self.status.pack(side="left", fill="x", expand=True)
+        # 常驻署名：任何界面状态下都在，截图必然带上。点它开「关于」
+        self._sign = tk.Label(
+            statusbar, text="%s  ·  原创  v%s" % (__author__, __version__),
+            bg=PANEL, fg=AMBER, font=(FONT_UI, 9), anchor="e",
+            padx=10, pady=6, cursor="hand2")
+        self._sign.pack(side="right")
+        self._sign.bind("<Button-1>", lambda _e: self._show_about())
 
         # --- 布局顺序：pack 按调用顺序分配空间，先来的先拿到固定高度。
         # 日志与状态条用 side="bottom" 自下而上贴边，Notebook 最后 pack 吃剩余空间。
@@ -1415,6 +1442,9 @@ class CleanerApp(object):
         self.head.create_text(14, 42, anchor="w", fill=TEXT_DIM,
                               font=(FONT_UI, 9),
                               text="只清理人工审核过的目标，清单之外的路径一律不碰")
+        # 右下角署名水印，跟随窗口宽度右对齐
+        self.head.create_text(w - 2, 42, anchor="e", fill=_mix(CYAN, 0.62),
+                              font=(FONT_UI, 9), text=SIGN_LINE)
 
         # 底部霓虹分割线
         self.head.create_line(0, h - 2, w, h - 2, fill=BORDER)
@@ -1465,6 +1495,10 @@ class CleanerApp(object):
         # 右侧三个窗口按钮
         bw = 46
         x = w - bw * 3
+        # 紧贴窗口按钮左侧的常驻署名
+        self.tb.create_text(x - 16, 21, anchor="e",
+                            text="BY %s · %s" % (__author__, __author_id__),
+                            fill=AMBER, font=(FONT_UI, 10, "bold"))
         self.tb.create_line(x, 8, x, h - 8, fill=BORDER)
         self._tb_button("min", x, bw, h)
         self._tb_button("max", x + bw, bw, h)
@@ -1870,6 +1904,33 @@ class CleanerApp(object):
     def log(self, msg):
         self.log_text.insert("end", "%s > %s\n" % (time.strftime("%H:%M:%S"), msg))
         self.log_text.see("end")
+
+    def _log_banner(self):
+        """启动横幅：跑一遍就会在日志里留下出处，抄走界面也抄不走这段输出。"""
+        bar = "-" * 58
+        self.log(bar)
+        self.log("%s  v%s   ·   作者 %s（GitHub: %s）"
+                 % (APP_NAME, __version__, __author__, __author_id__))
+        self.log("源码 %s" % __homepage__)
+        self.log("%s   指纹 %s" % (__copyright__, FINGERPRINT))
+        self.log(bar)
+
+    def _show_about(self):
+        """关于对话框：作者、版本、仓库、版权、指纹。"""
+        from tkinter import messagebox
+        messagebox.showinfo(
+            "关于 " + APP_NAME,
+            "%s\n\n"
+            "版本    v%s\n"
+            "作者    %s（GitHub: %s）\n"
+            "源码    %s\n"
+            "指纹    %s\n\n"
+            "%s\n\n"
+            "本程序为原创工具，源码公开。\n"
+            "欢迎转发原版链接，请勿改名倒卖或二次打包冒充原创。"
+            % (APP_NAME, __version__, __author__, __author_id__,
+               __homepage__, FINGERPRINT, __copyright__),
+            parent=self.root)
 
     def set_status(self, text):
         self.status.configure(text=text)
@@ -2294,6 +2355,16 @@ def _fatal(msg, title=APP_NAME):
 
 def main():
     global tk
+
+    if "--version" in sys.argv or "-V" in sys.argv:
+        info = ("%s v%s\n作者 %s（GitHub: %s）\n%s\n指纹 %s\n源码 %s\n"
+                % (APP_NAME, __version__, __author__, __author_id__,
+                   __copyright__, FINGERPRINT, __homepage__))
+        try:
+            sys.stdout.write(info)
+        except UnicodeEncodeError:
+            sys.stdout.buffer.write(info.encode("utf-8"))
+        return 0
 
     if not IS_WINDOWS:
         _fatal("本工具仅支持 Windows。")

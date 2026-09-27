@@ -2,6 +2,9 @@
 """
 程序化生成图标：赛博朋克垃圾桶。
 
+Copyright (C) 2026 柯夜 (sickpoet). 保留所有权利。
+源码：https://github.com/sickpoet/cdisk-cleaner
+
 配色和界面共用一套：近黑底 + 霓虹青描边 + 品红点缀。
 在 8 倍分辨率上绘制再 LANCZOS 缩小，边缘比直接画小图干净得多；
 16/20px 会糊，所以单独给一套加粗的简化造型。
