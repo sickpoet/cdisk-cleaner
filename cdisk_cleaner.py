@@ -1,0 +1,1410 @@
+# -*- coding: utf-8 -*-
+"""
+C 盘垃圾清理器
+
+白名单制清理工具。只处理内置清单里经过人工审核的目标，清单之外的路径一律不碰。
+
+设计原则
+--------
+1. 白名单优先：删除前必须证明路径落在某个已审核的清理目标内，证明不了就拒绝。
+2. 双闸门：先过「白名单归属」检查，再过「绝对保护区」检查，两者都通过才允许删。
+   少数系统目标（Windows\\Temp 等）靠 allow_protected 显式放行。
+3. 先扫后清：扫描全只读，把每一项的大小和文件数摆出来，由使用者勾选后再执行。
+4. 空目录单列：默认不勾选，且强制跳过系统保护区。
+
+只用标准库，零第三方依赖。
+"""
+
+__version__ = "1.0.0"
+APP_NAME = "C 盘垃圾清理器"
+
+import ctypes
+import glob
+import os
+import queue
+import shutil
+import stat
+import sys
+import threading
+import time
+from ctypes import wintypes
+
+IS_WINDOWS = sys.platform == "win32"
+
+tk = None  # 延迟导入，见 main()
+
+# ---------------------------------------------------------------- 常量
+
+LEVEL_SAFE = "safe"      # 纯垃圾，删了没有任何影响
+LEVEL_CACHED = "cached"  # 缓存，删后程序会自己重建或重新下载
+LEVEL_RISKY = "risky"    # 有副作用，默认不勾选
+
+DEFAULT_CHECKED = (LEVEL_SAFE, LEVEL_CACHED)
+
+SYSTEM_DRIVE = os.environ.get("SystemDrive", "C:")
+
+# onefile 打包时，程序自身会解压到 %TEMP%\\_MEIxxxxx。清理临时文件时
+# 必须跳过它，否则等于把自己脚下的地板拆了。
+SELF_RUNTIME_DIR = getattr(sys, "_MEIPASS", None)
+
+
+# ---------------------------------------------------------------- 通用工具
+
+def norm(path):
+    """规范化路径，用于比较。失败时退回原值。"""
+    try:
+        return os.path.normcase(os.path.normpath(os.path.abspath(path)))
+    except (OSError, ValueError):
+        return os.path.normcase(path)
+
+
+def is_within(path, root):
+    """path 是否等于 root 或位于 root 之下。"""
+    n = norm(path)
+    r = norm(root)
+    return n == r or n.startswith(r + os.sep)
+
+
+def human_size(n):
+    """把字节数格式化成人类可读。"""
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return "-"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024:
+            return "%d B" % int(n) if unit == "B" else "%.1f %s" % (n, unit)
+        n /= 1024.0
+    return "%.1f PB" % n
+
+
+def disk_usage(drive):
+    """
+    读取磁盘容量。drive 传 'C' 或 'C:' 都行。
+    返回 (总, 已用, 可用) 字节数；失败返回 None。
+    """
+    letter = drive.rstrip(":").rstrip("\\/")
+    if not letter:
+        return None
+    try:
+        u = shutil.disk_usage(letter + ":" + os.sep)
+        return u.total, u.used, u.free
+    except OSError:
+        return None
+
+
+def long_path(path):
+    """
+    把 8.3 短名（C:\\Users\\ADMINI~1\\...）展开成完整长名。
+    只影响界面显示，不影响任何判断逻辑。展开失败时原样返回。
+    """
+    try:
+        buf = ctypes.create_unicode_buffer(32768)
+        n = ctypes.windll.kernel32.GetLongPathNameW(path, buf, 32768)
+        if n and n < 32768 and buf.value:
+            return buf.value
+    except Exception:
+        pass
+    return path
+
+
+def is_admin():
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------- 路径守卫
+
+def _local_user_profiles():
+    """列出本机所有本地用户的主目录。"""
+    out = []
+    users_root = os.path.join(SYSTEM_DRIVE + os.sep, "Users")
+    if os.path.isdir(users_root):
+        try:
+            with os.scandir(users_root) as it:
+                for e in it:
+                    try:
+                        if e.is_dir(follow_symlinks=False) and not e.name.startswith("."):
+                            out.append(e.path)
+                    except OSError:
+                        continue
+        except OSError:
+            pass
+    return out
+
+
+def _build_protected_roots():
+    """
+    绝对保护区。落在这些目录下的东西，即使命中了白名单也不许删，
+    除非该白名单目标显式声明 allow_protected=True（只有确实身处系统目录
+    的 Windows\\Temp、软件分发缓存等少数目标才这么标）。
+    """
+    prot = [
+        os.path.join(SYSTEM_DRIVE + os.sep, "Windows"),
+        os.path.join(SYSTEM_DRIVE + os.sep, "Program Files"),
+        os.path.join(SYSTEM_DRIVE + os.sep, "Program Files (x86)"),
+        os.path.join(SYSTEM_DRIVE + os.sep, "ProgramData"),
+        os.path.join(SYSTEM_DRIVE + os.sep, "Recovery"),
+        os.path.join(SYSTEM_DRIVE + os.sep, "$Recycle.Bin"),
+        os.path.join(SYSTEM_DRIVE + os.sep, "System Volume Information"),
+        os.path.join(SYSTEM_DRIVE + os.sep, "Boot"),
+        os.path.join(SYSTEM_DRIVE + os.sep, "EFI"),
+    ]
+    # 用户目录下的「内容型」目录：放的是用户资料与程序配置，永远不碰
+    user_sensitive = (
+        ("AppData", "Roaming"),
+        ("AppData", "LocalLow"),
+        ("AppData", "Local", "Packages"),
+        "Documents", "Desktop", "Pictures", "Videos", "Music", "Downloads",
+        "OneDrive", "Favorites", "Links", "Contacts", "Saved Games",
+        "Searches", "3D Objects", "NetHood", "PrintHood", "SendTo",
+        "Templates", "Recent",
+    )
+    for home in _local_user_profiles():
+        for rel in user_sensitive:
+            parts = rel if isinstance(rel, tuple) else (rel,)
+            prot.append(os.path.join(home, *parts))
+    return [norm(p) for p in prot]
+
+
+PROTECTED_ROOTS = _build_protected_roots()
+
+# 硬禁区：任何目标都不得越过，allow_protected 也不行
+_NEVER = [
+    norm(os.path.join(SYSTEM_DRIVE + os.sep, "Windows", sub)) for sub in (
+        "System32", "SysWOW64", "WinSxS", "assembly", "Microsoft.NET",
+        "Fonts", "Installer", "servicing", "Boot", "INF", "SystemApps",
+        "PolicyDefinitions", "diagnostics",
+    )
+]
+
+
+def is_empty_dir(path):
+    """严格判空：一条条目都没有才算空。带 desktop.ini 的不会被误判。"""
+    try:
+        with os.scandir(path) as it:
+            for _ in it:
+                return False
+        return True
+    except OSError:
+        return False
+
+
+class GuardError(Exception):
+    """路径未通过安全校验。"""
+
+
+def guard(path, allowed_root=None, allow_protected=False):
+    """
+    删除前的最后一道闸门。不通过就抛 GuardError。
+
+    allowed_root     本次删除所属的白名单目标根目录，path 必须落在其内
+    allow_protected  该目标是否被授权越过保护区（仅系统级临时目录等少数项）
+    """
+    if not path:
+        raise GuardError("空路径")
+
+    n = norm(path)
+
+    # 1) 绝不删盘符根目录
+    _drive, tail = os.path.splitdrive(n)
+    if tail in ("", os.sep):
+        raise GuardError("拒绝删除盘符根目录：%s" % path)
+
+    # 2) 绝不删用户主目录本身
+    for home in _local_user_profiles():
+        if n == norm(home):
+            raise GuardError("拒绝删除用户主目录：%s" % path)
+
+    # 3) 绝不删当前程序自身的运行目录（onefile 时位于 %TEMP%）
+    if SELF_RUNTIME_DIR and is_within(n, SELF_RUNTIME_DIR):
+        raise GuardError("拒绝删除本程序自身的运行目录")
+
+    # 4) 白名单归属：必须落在允许的根目录内
+    if allowed_root is not None and not is_within(n, allowed_root):
+        raise GuardError("路径不在允许范围内：%s" % path)
+
+    # 5) 硬禁区
+    for p in _NEVER:
+        if n == p or n.startswith(p + os.sep):
+            raise GuardError("路径位于系统关键目录，禁止删除：%s" % path)
+
+    # 6) 保护区
+    if not allow_protected:
+        for p in PROTECTED_ROOTS:
+            if n == p or n.startswith(p + os.sep):
+                raise GuardError("路径位于保护区，禁止删除：%s" % path)
+
+    return True
+
+
+# ---------------------------------------------------------------- 清理目标
+
+class Target(object):
+    """
+    一个清理目标。可能对应一个目录，也可能对应一组（glob 展开的）目录。
+
+    exists 是三态：
+        None  还没扫描过
+        True  扫描确认存在
+        False 扫描确认不存在
+
+    mode:
+        contents   删除目录内的全部内容，保留目录本身（推荐，程序期望目录存在）
+        tree       整个目录连根删除
+        pattern    只删目录下匹配 pattern 的文件
+        recyclebin 清空回收站，走系统 API
+    """
+
+    __slots__ = ("key", "label", "paths", "mode", "level", "note",
+                 "need_admin", "allow_protected", "pattern",
+                 "size", "files", "errcount", "checked", "exists")
+
+    def __init__(self, key, label, paths, mode="contents", level=LEVEL_SAFE,
+                 note="", need_admin=False, allow_protected=False, pattern=None):
+        self.key = key                 # 全局唯一的界面 id
+        self.label = label
+        self.paths = list(paths)
+        self.mode = mode
+        self.level = level
+        self.note = note
+        self.need_admin = need_admin
+        self.allow_protected = allow_protected
+        self.pattern = pattern
+        self.size = 0
+        self.files = 0
+        self.errcount = 0
+        self.checked = level in DEFAULT_CHECKED
+        self.exists = None
+
+    @property
+    def path(self):
+        """主路径，用于展示。"""
+        return self.paths[0] if self.paths else ""
+
+    def __repr__(self):
+        return "<Target %s %s>" % (self.label, self.paths)
+
+
+# 字段顺序：key, 显示名, 路径模板, mode, level, 说明, 需管理员, 越过保护区, pattern
+TARGET_SPECS = [
+    # ---------------- 临时文件 ----------------
+    ("temp_user", "用户临时文件", r"%TEMP%", "contents", LEVEL_SAFE,
+     "程序运行时产生的临时文件，可随时删除。正在被占用的会自动跳过",
+     False, False, None),
+    ("temp_system", "系统临时文件", r"C:\Windows\Temp", "contents", LEVEL_SAFE,
+     "系统级临时文件。需要管理员权限，普通权限下会被跳过",
+     True, True, None),
+    ("wer", "错误报告存档", r"%LOCALAPPDATA%\Microsoft\Windows\WER", "contents",
+     LEVEL_SAFE, "程序崩溃时生成的错误报告", False, False, None),
+    ("crashdumps", "崩溃转储文件", r"%LOCALAPPDATA%\CrashDumps", "contents",
+     LEVEL_SAFE, "崩溃时转储的内存镜像，单个文件可达数百 MB", False, False, None),
+
+    # ---------------- 系统缓存 ----------------
+    ("wu_download", "Windows 更新缓存",
+     r"C:\Windows\SoftwareDistribution\Download", "contents", LEVEL_SAFE,
+     "已下载的更新安装包，装完就没用了。需要管理员权限", True, True, None),
+    ("delivery", "传递优化缓存",
+     r"C:\Windows\SoftwareDistribution\DeliveryOptimization", "contents",
+     LEVEL_SAFE, "Windows 更新的 P2P 分发缓存。需要管理员权限", True, True, None),
+    ("thumbcache", "缩略图缓存", r"%LOCALAPPDATA%\Microsoft\Windows\Explorer",
+     "pattern", LEVEL_SAFE, "资源管理器的缩略图数据库，会自动重建（只删 *.db）",
+     False, False, ("thumbcache_*.db", "iconcache_*.db")),
+
+    # ---------------- 显卡着色器缓存 ----------------
+    ("d3d", "D3D 着色器缓存", r"%LOCALAPPDATA%\D3DSCache", "contents",
+     LEVEL_SAFE, "DirectX 着色器编译缓存，游戏会自动重建", False, False, None),
+    ("nvdx", "NVIDIA 着色器缓存", r"%LOCALAPPDATA%\NVIDIA\DXCache", "contents",
+     LEVEL_SAFE, "N 卡着色器缓存，会自动重建", False, False, None),
+    ("nvgc", "NVIDIA GL 缓存", r"%LOCALAPPDATA%\NVIDIA\GLCache", "contents",
+     LEVEL_SAFE, "N 卡 OpenGL 着色器缓存", False, False, None),
+    ("nvcache", "NVIDIA NV_Cache", r"%LOCALAPPDATA%\NVIDIA Corporation\NV_Cache",
+     "contents", LEVEL_SAFE, "NVIDIA 驱动缓存", False, False, None),
+    ("amdcache", "AMD 着色器缓存", r"%LOCALAPPDATA%\AMD\DxCache", "contents",
+     LEVEL_SAFE, "A 卡着色器缓存，会自动重建", False, False, None),
+    ("amdcache2", "AMD GL 缓存", r"%LOCALAPPDATA%\AMD\GLCache", "contents",
+     LEVEL_SAFE, "A 卡 OpenGL 着色器缓存", False, False, None),
+
+    # ---------------- 浏览器缓存（只碰 Cache，不碰书签密码 Cookie）----------------
+    ("chrome", "Chrome 网页缓存",
+     r"%LOCALAPPDATA%\Google\Chrome\User Data\Default\Cache", "contents",
+     LEVEL_SAFE, "网页缓存。不动书签、密码、Cookie、登录状态", False, False, None),
+    ("edge", "Edge 网页缓存",
+     r"%LOCALAPPDATA%\Microsoft\Edge\User Data\Default\Cache", "contents",
+     LEVEL_SAFE, "网页缓存。不动书签、密码、Cookie、登录状态", False, False, None),
+    ("ffcache", "Firefox 网页缓存",
+     r"%LOCALAPPDATA%\Mozilla\Firefox\Profiles\*\cache2", "contents",
+     LEVEL_SAFE, "只删 cache2，不动配置、书签、密码", False, False, None),
+    ("chromeext", "Chrome 扩展缓存", r"%LOCALAPPDATA%\ChromeExtensionCache",
+     "contents", LEVEL_SAFE, "Chrome 扩展的缓存文件", False, False, None),
+
+    # ---------------- 开发工具缓存 ----------------
+    ("pip", "pip 缓存", r"%LOCALAPPDATA%\pip\Cache", "contents", LEVEL_CACHED,
+     "Python 包下载缓存，下次装包会重新下载", False, False, None),
+    ("npm", "npm 缓存", r"%LOCALAPPDATA%\npm-cache", "contents", LEVEL_CACHED,
+     "npm 包缓存，会自动重建", False, False, None),
+    ("pnpm", "pnpm 缓存", r"%LOCALAPPDATA%\pnpm-cache", "contents", LEVEL_CACHED,
+     "pnpm 包缓存", False, False, None),
+    ("yarn", "Yarn 缓存", r"%LOCALAPPDATA%\Yarn\Cache", "contents", LEVEL_CACHED,
+     "Yarn 包缓存", False, False, None),
+    ("uv", "uv 缓存", r"%LOCALAPPDATA%\uv\cache", "contents", LEVEL_CACHED,
+     "uv 包缓存。只清 cache，不动 uv 管理的 Python 解释器", False, False, None),
+    ("nuget", "NuGet 包缓存", r"%USERPROFILE%\.nuget\packages", "contents",
+     LEVEL_CACHED, "C# 包缓存，删后首次编译会重新下载", False, False, None),
+    ("gomod", "Go 模块缓存", r"%USERPROFILE%\go\pkg\mod", "contents",
+     LEVEL_CACHED, "Go 模块缓存，删后首次构建会重新下载", False, False, None),
+    ("cargo", "Cargo 缓存", r"%USERPROFILE%\.cargo\registry", "contents",
+     LEVEL_CACHED, "Rust 包缓存", False, False, None),
+    ("gradle", "Gradle 缓存", r"%USERPROFILE%\.gradle\caches", "contents",
+     LEVEL_CACHED, "Java 构建缓存，删后首次构建会重新下载", False, False, None),
+    ("gencache", "通用工具缓存", r"%USERPROFILE%\.cache", "contents",
+     LEVEL_CACHED, "各类命令行工具自建的缓存目录", False, False, None),
+
+    # ---------------- 应用更新残留 ----------------
+    ("updater", "应用更新残留", r"%LOCALAPPDATA%\*-updater", "contents",
+     LEVEL_CACHED, "各类客户端下载完的更新包，装完即无用。下次更新会重新下载",
+     False, False, None),
+
+    # ---------------- 有副作用的，默认不勾 ----------------
+    ("winold", "旧版 Windows 文件", r"C:\Windows.old", "tree", LEVEL_RISKY,
+     "系统升级前的旧文件。删后无法回退到旧版本。需要管理员权限", True, True, None),
+    ("recyclebin", "回收站（清空）", "", "recyclebin", LEVEL_RISKY,
+     "彻底清空回收站，不可撤销。用「送回收站」模式清出的东西也在这里面",
+     False, False, None),
+]
+
+
+def _expand_spec(tmpl):
+    """展开环境变量，带通配符的做 glob，顺手把短名转成长名。"""
+    expanded = os.path.expandvars(tmpl)
+    if not expanded:
+        return []
+    if "*" in expanded or "?" in expanded:
+        return sorted(long_path(p) for p in glob.glob(expanded)
+                      if os.path.isdir(p))
+    return [long_path(expanded)]
+
+
+def build_targets():
+    """把 TARGET_SPECS 展开成 Target 列表。每一项都拿到全局唯一的 key。"""
+    out = []
+    for idx, (key, label, tmpl, mode, level, note, need_admin,
+              allow_protected, pattern) in enumerate(TARGET_SPECS):
+        if mode == "recyclebin":
+            out.append(Target("uid%d" % idx, label, [], mode, level, note,
+                              need_admin, allow_protected, pattern))
+            continue
+
+        paths = _expand_spec(tmpl)
+        if len(paths) <= 1:
+            out.append(Target("uid%d" % idx, label, paths or
+                              [long_path(os.path.expandvars(tmpl))], mode, level,
+                              note, need_admin, allow_protected, pattern))
+        else:
+            # 通配展开出多个目录时合成一个目标，避免列表被刷屏
+            out.append(Target("uid%d" % idx, label, paths, mode, level,
+                              "%s（共 %d 个目录）" % (note, len(paths)),
+                              need_admin, allow_protected, pattern))
+    return out
+
+
+# ---------------------------------------------------------------- 扫描
+
+def _measure(root, pattern=None):
+    """
+    统计 root 下的字节数与文件数。只读。
+    返回 (bytes, files, errcount)
+    """
+    total = 0
+    files = 0
+    errs = 0
+
+    if pattern:
+        for pat in pattern:
+            for p in glob.glob(os.path.join(root, pat)):
+                try:
+                    if os.path.isfile(p):
+                        total += os.path.getsize(p)
+                        files += 1
+                    elif os.path.isdir(p):
+                        b, f, e = _measure(p)
+                        total += b
+                        files += f
+                        errs += e
+                except OSError:
+                    errs += 1
+        return total, files, errs
+
+    stack = [root]
+    while stack:
+        d = stack.pop()
+        try:
+            with os.scandir(d) as it:
+                for e in it:
+                    try:
+                        if e.is_dir(follow_symlinks=False):
+                            stack.append(e.path)
+                        elif e.is_file(follow_symlinks=False):
+                            total += e.stat(follow_symlinks=False).st_size
+                            files += 1
+                    except OSError:
+                        errs += 1
+        except OSError:
+            errs += 1
+    return total, files, errs
+
+
+class SHQUERYRBINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("i64Size", ctypes.c_longlong),
+        ("i64NumItems", ctypes.c_longlong),
+    ]
+
+
+def query_recyclebin(drive=None):
+    """
+    用系统 API 查询回收站大小与条目数，比遍历文件系统快几个数量级。
+    drive 传 None 表示所有盘。返回 (字节数, 条目数)。
+    """
+    info = SHQUERYRBINFO()
+    info.cbSize = ctypes.sizeof(info)
+    try:
+        fn = ctypes.windll.shell32.SHQueryRecycleBinW
+        fn.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(SHQUERYRBINFO)]
+        fn.restype = ctypes.c_long
+        rc = fn(drive, ctypes.byref(info))
+        if rc == 0:
+            return max(info.i64Size, 0), max(info.i64NumItems, 0)
+    except Exception:
+        pass
+    return 0, 0
+
+
+def measure_recyclebin():
+    """
+    遍历回收站的数据目录统计大小。
+
+    比 SHQueryRecycleBin 快得多：本机 16 万项时 API 要 50 秒，遍历只要 6 秒。
+    API 在项数极多时会逐个解析 $I 元数据，开销随项数急剧上升。
+    无权限读取的账户目录（如系统账户）会被跳过，所以结果会比 API 略小。
+    """
+    total = 0
+    files = 0
+    for letter in "CDEFGHIJKLMNOPQRSTUVWXYZ":
+        rb = letter + ":" + os.sep + "$Recycle.Bin"
+        if not os.path.isdir(rb):
+            continue
+        try:
+            with os.scandir(rb) as it:
+                for e in it:
+                    if not e.is_dir(follow_symlinks=False):
+                        continue
+                    try:
+                        b, f, _ = _measure(e.path)
+                        total += b
+                        files += f
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return total, files
+
+
+def scan_targets(targets, progress=None, cancel=None, skip_recyclebin=True):
+    """
+    扫描全部目标。只读操作，不修改任何文件。
+
+    skip_recyclebin：回收站统计偏慢（本机约 6 秒），默认跳过，
+    由调用方另起线程去跑，免得拖住其他只需不到 1 秒的项目。
+    """
+    for t in targets:
+        if cancel is not None and cancel.is_set():
+            return
+
+        if t.mode == "recyclebin":
+            if skip_recyclebin:
+                continue
+            b, n = measure_recyclebin()
+            t.exists = True
+            t.size, t.files = b, n
+            t.errcount = 0
+            if progress:
+                progress(t)
+            continue
+
+        total = files = errs = 0
+        found = False
+        for p in t.paths:
+            if not os.path.exists(p):
+                continue
+            found = True
+            b, f, e = _measure(p, t.pattern)
+            total += b
+            files += f
+            errs += e
+        t.exists = found
+        t.size, t.files, t.errcount = total, files, errs
+        if progress:
+            progress(t)
+
+
+# ---------------------------------------------------------------- 删除
+
+class SHFILEOPSTRUCTW(ctypes.Structure):
+    _fields_ = [
+        ("hwnd", wintypes.HWND),
+        ("wFunc", wintypes.UINT),
+        ("pFrom", wintypes.LPCWSTR),
+        ("pTo", wintypes.LPCWSTR),
+        ("fFlags", ctypes.c_uint16),
+        ("fAnyOperationsAborted", wintypes.BOOL),
+        ("hNameMappings", ctypes.c_void_p),
+        ("lpszProgressTitle", wintypes.LPCWSTR),
+    ]
+
+
+FO_DELETE = 3
+FOF_MULTIDESTFILES = 0x0001
+FOF_NOCONFIRMATION = 0x0010
+FOF_SILENT = 0x0004
+FOF_NOERRORUI = 0x0400
+FOF_ALLOWUNDO = 0x0040
+
+
+def _send_to_recyclebin(paths):
+    """
+    把一批路径送进回收站。返回 (成功数, 幸存列表)。
+    一次调用处理整批，比逐个调用快得多。
+    """
+    paths = [p for p in paths if p and os.path.exists(p)]
+    if not paths:
+        return 0, []
+
+    try:
+        ctypes.windll.ole32.CoInitialize(None)
+    except Exception:
+        pass
+
+    buf = ctypes.create_unicode_buffer("\0".join(paths) + "\0\0")
+    op = SHFILEOPSTRUCTW()
+    ctypes.memset(ctypes.byref(op), 0, ctypes.sizeof(op))
+    op.wFunc = FO_DELETE
+    op.pFrom = ctypes.cast(buf, wintypes.LPCWSTR)
+    op.fFlags = (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI
+                 | FOF_SILENT | FOF_MULTIDESTFILES)
+
+    shell32 = ctypes.windll.shell32
+    shell32.SHFileOperationW.argtypes = [ctypes.POINTER(SHFILEOPSTRUCTW)]
+    shell32.SHFileOperationW.restype = ctypes.c_int
+    shell32.SHFileOperationW(ctypes.byref(op))
+
+    survivors = [p for p in paths if os.path.exists(p)]
+    return len(paths) - len(survivors), survivors
+
+
+def _rmtree_force(path):
+    """删文件/目录，遇到只读的先去掉只读属性再删。"""
+
+    def onerror(func, p, exc_info):
+        try:
+            os.chmod(p, stat.S_IWRITE)
+            func(p)
+        except OSError:
+            pass
+
+    if os.path.islink(path):
+        os.unlink(path)
+    elif os.path.isdir(path):
+        shutil.rmtree(path, onerror=onerror)
+    elif os.path.exists(path):
+        try:
+            os.remove(path)
+        except PermissionError:
+            os.chmod(path, stat.S_IWRITE)
+            os.remove(path)
+
+
+def empty_recyclebin():
+    """清空回收站。不可逆。返回是否调用成功。"""
+    try:
+        fn = ctypes.windll.shell32.SHEmptyRecycleBinW
+        fn.argtypes = [wintypes.HWND, wintypes.LPCWSTR, wintypes.DWORD]
+        fn.restype = ctypes.c_long
+        SHERB_NOCONFIRMATION = 0x1
+        SHERB_NOPROGRESSUI = 0x2
+        SHERB_NOSOUND = 0x4
+        fn(None, None, SHERB_NOCONFIRMATION | SHERB_NOPROGRESSUI | SHERB_NOSOUND)
+        return True
+    except Exception:
+        return False
+
+
+def _clear_one_root(root, target, use_recyclebin, log):
+    """
+    清空单个根目录下的内容。返回 (释放字节, 删除文件数, 失败项数)。
+    每一个待删路径都要过 guard()，未通过的直接跳过并计数。
+    """
+    freed = 0
+    removed_files = 0
+    failed = 0
+
+    if target.mode == "pattern":
+        victims = []
+        for pat in (target.pattern or ()):
+            victims.extend(glob.glob(os.path.join(root, pat)))
+    elif target.mode == "tree":
+        victims = [root]
+    else:  # contents
+        try:
+            with os.scandir(root) as it:
+                victims = [e.path for e in it]
+        except OSError as exc:
+            if log:
+                log("  无法读取 %s：%s" % (root, exc))
+            return 0, 0, 1
+
+    safe = []
+    for v in victims:
+        try:
+            guard(v, allowed_root=root, allow_protected=target.allow_protected)
+        except GuardError as exc:
+            failed += 1
+            if log:
+                log("  [拒绝] %s" % exc)
+            continue
+        safe.append(v)
+
+    if not safe:
+        return 0, 0, failed
+
+    # 先量体积——删完就量不到了
+    for v in safe:
+        try:
+            if os.path.islink(v):
+                continue
+            if os.path.isfile(v):
+                freed += os.path.getsize(v)
+                removed_files += 1
+            elif os.path.isdir(v):
+                b, f, _ = _measure(v)
+                freed += b
+                removed_files += f
+        except OSError:
+            pass
+
+    if use_recyclebin:
+        _ok, survivors = _send_to_recyclebin(safe)
+        failed += len(survivors)
+        if log and survivors:
+            log("  %d 项未能送入回收站（多被占用或权限不足）" % len(survivors))
+    else:
+        for v in safe:
+            try:
+                _rmtree_force(v)
+            except OSError as exc:
+                failed += 1
+                if log:
+                    log("  [失败] %s：%s" % (os.path.basename(v), exc))
+
+    return freed, removed_files, failed
+
+
+def clear_target(target, use_recyclebin=False, log=None):
+    """清空一个目标。返回 (释放字节, 删除文件数, 失败项数)。"""
+    if target.mode == "recyclebin":
+        before, _n = measure_recyclebin()
+        ok = empty_recyclebin()
+        if not ok and log:
+            log("  清空回收站调用失败")
+        return before, 0, 0 if ok else 1
+
+    freed = files = failed = 0
+    for root in target.paths:
+        if not os.path.exists(root):
+            continue
+        b, f, e = _clear_one_root(root, target, use_recyclebin, log)
+        freed += b
+        files += f
+        failed += e
+    return freed, files, failed
+
+
+# ---------------------------------------------------------------- 空文件夹扫描
+
+# 这些目录名一律跳过，不管出现在哪一层
+SKIP_DIR_NAMES = {
+    "$recycle.bin", "system volume information", "$windows.~bt", "$windows.~ws",
+    "windows", "program files", "program files (x86)", "programdata",
+    "recovery", "perflogs", "config.msi", "msocache",
+    "appdata", "onedrive", "node_modules", ".git", ".svn", ".hg",
+    "venv", ".venv", "env", "__pycache__", ".idea", ".vscode", ".vs",
+    "packages", "obj", "bin", "target", "dist", "build", "out",
+    ".cache", ".gradle", ".m2", ".npm", ".nuget", ".cargo", ".rustup",
+    ".ssh", ".gnupg", "temp", "tmp", "cache", "caches",
+    "3d objects", "saved games", "nethood", "printhood", "sendto",
+    "templates", "recent", "favorites", "links", "contacts", "searches",
+}
+
+
+def _empty_scan_roots():
+    """
+    空文件夹的扫描根：非系统盘的根目录 + 用户主目录（会跳过敏感子目录）。
+    系统盘的系统目录一律不进入。
+    """
+    roots = []
+    sys_letter = SYSTEM_DRIVE.rstrip(":").upper()
+    for letter in "DEFGHIJKLMNOPQRSTUVWXYZ":
+        if letter == sys_letter:
+            continue
+        p = letter + ":" + os.sep
+        if os.path.isdir(p):
+            roots.append(p)
+    roots.extend(_local_user_profiles())
+    return roots
+
+
+def scan_empty_dirs(progress=None, cancel=None, limit=20000):
+    """
+    找出空文件夹。只读。
+    保护区内的路径会被剔除；「空」按严格判定（一条条目都没有）。
+    """
+    found = []
+    for root in _empty_scan_roots():
+        if cancel is not None and cancel.is_set():
+            break
+        stack = [root]
+        while stack:
+            if cancel is not None and cancel.is_set():
+                break
+            d = stack.pop()
+            is_root = (d == root)
+
+            dn = norm(d)
+            if any(dn == p or dn.startswith(p + os.sep) for p in PROTECTED_ROOTS):
+                continue
+
+            try:
+                with os.scandir(d) as it:
+                    entries = list(it)
+            except OSError:
+                continue
+
+            if not entries:
+                if not is_root:
+                    found.append(d)
+                    if progress and len(found) % 50 == 0:
+                        progress(len(found))
+                    if len(found) >= limit:
+                        return found
+                continue
+
+            for e in entries:
+                try:
+                    if e.is_dir(follow_symlinks=False):
+                        if e.name.lower() not in SKIP_DIR_NAMES:
+                            stack.append(e.path)
+                except OSError:
+                    continue
+    return found
+
+
+# ---------------------------------------------------------------- GUI
+
+def _enable_dpi_awareness():
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+
+CHECKED = "\u2611"     # ☑
+UNCHECKED = "\u2610"   # ☐
+PENDING = "\u2014"     # —
+
+
+class CleanerApp(object):
+
+    def __init__(self, root, autoscan=True):
+        self.root = root
+        self.targets = build_targets()
+        self.empty_checked = set()
+        self.msgq = queue.Queue()
+        self.busy = False
+        self.alive = True
+        self.cancel = threading.Event()
+        self.use_recyclebin = tk.BooleanVar(value=False)
+
+        root.title("%s  v%s" % (APP_NAME, __version__))
+        root.geometry("900x660")
+        root.minsize(800, 580)
+
+        self._build_ui()
+        self._refresh_drive_info()
+        self.log("就绪。扫描过程只读，不会删任何东西。")
+        if not is_admin():
+            self.log("当前非管理员权限：「系统临时文件」「Windows 更新缓存」"
+                     "等几项会被跳过，其余照常。")
+
+        self.root.after(120, self._drain_queue)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        if autoscan:
+            self.root.after(400, self.on_scan)
+
+    # ---------------- 界面 ----------------
+
+    def _build_ui(self):
+        from tkinter import ttk
+
+        outer = ttk.Frame(self.root, padding=(10, 8, 10, 8))
+        outer.pack(fill="both", expand=True)
+
+        top = ttk.Frame(outer)
+        top.pack(fill="x")
+        self.drive_label = ttk.Label(top, text="正在读取磁盘信息 ...")
+        self.drive_label.pack(side="left")
+        ttk.Label(top, text="v" + __version__, foreground="#888").pack(side="right")
+
+        bar = ttk.Frame(outer)
+        bar.pack(fill="x", pady=(8, 6))
+        self.btn_scan = ttk.Button(bar, text="扫描", width=10, command=self.on_scan)
+        self.btn_scan.pack(side="left")
+        self.btn_clean = ttk.Button(bar, text="清理选中项", width=14,
+                                    command=self.on_clean, state="disabled")
+        self.btn_clean.pack(side="left", padx=(6, 0))
+        self.btn_all = ttk.Button(bar, text="全选", width=8,
+                                  command=self.on_check_all)
+        self.btn_all.pack(side="left", padx=(14, 0))
+        self.btn_none = ttk.Button(bar, text="全不选", width=8,
+                                   command=self.on_check_none)
+        self.btn_none.pack(side="left", padx=(4, 0))
+
+        ttk.Label(bar, text="   删除方式:").pack(side="left", padx=(14, 2))
+        ttk.Radiobutton(bar, text="永久删除", value=False,
+                        variable=self.use_recyclebin).pack(side="left")
+        ttk.Radiobutton(bar, text="送回收站", value=True,
+                        variable=self.use_recyclebin).pack(side="left", padx=(6, 0))
+
+        self.nb = ttk.Notebook(outer)
+        self.nb.pack(fill="both", expand=True)
+        self._build_targets_tab()
+        self._build_empty_tab()
+
+        log_head = ttk.Frame(outer)
+        log_head.pack(fill="x", pady=(8, 2))
+        ttk.Label(log_head, text="日志").pack(side="left")
+        ttk.Button(log_head, text="清空日志", width=8,
+                   command=lambda: self.log_text.delete("1.0", "end")).pack(side="right")
+
+        logf = ttk.Frame(outer)
+        logf.pack(fill="both", expand=False)
+        self.log_text = tk.Text(logf, height=8, wrap="none",
+                                font=("Consolas", 9), relief="solid", borderwidth=1)
+        sb = ttk.Scrollbar(logf, orient="vertical", command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=sb.set)
+        self.log_text.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+        self.status = ttk.Label(outer, text="就绪")
+        self.status.pack(anchor="w", pady=(6, 0))
+
+    def _build_targets_tab(self):
+        from tkinter import ttk
+
+        frame = ttk.Frame(self.nb)
+        self.nb.add(frame, text="垃圾与临时文件")
+
+        cols = ("chk", "name", "size", "count", "note")
+        self.tree = ttk.Treeview(frame, columns=cols, show="headings",
+                                 selectmode="browse")
+        for cid, text, width, anchor, stretch in (
+                ("chk", "", 32, "center", False),
+                ("name", "项目", 170, "w", False),
+                ("size", "大小", 90, "e", False),
+                ("count", "文件数", 80, "e", False),
+                ("note", "说明", 480, "w", True)):
+            self.tree.heading(cid, text=text)
+            self.tree.column(cid, width=width, anchor=anchor, stretch=stretch)
+
+        self.tree.tag_configure("risky", foreground="#b26a00")
+        self.tree.tag_configure("missing", foreground="#aaaaaa")
+        self.tree.tag_configure("admin", foreground="#00558c")
+
+        sb = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+        self.tree.bind("<Button-1>", self._on_tree_click)
+        self.tree.bind("<space>",
+                       lambda _e: self._toggle_target(self.tree.selection()))
+
+        for t in self.targets:
+            self.tree.insert("", "end", iid=t.key, tags=(self._tag_of(t),),
+                             values=self._row_values(t))
+
+    def _build_empty_tab(self):
+        from tkinter import ttk
+
+        frame = ttk.Frame(self.nb)
+        self.nb.add(frame, text="空文件夹")
+
+        ttk.Label(
+            frame, justify="left", wraplength=840, foreground="#555",
+            text="空文件夹默认不勾选。系统目录（Windows、Program Files、AppData、"
+                 "回收站等）已强制排除，根本不参与扫描。"
+                 "提示：这一项收益有限——一个空目录在 NTFS 上只占几 KB。"
+        ).pack(anchor="w", padx=6, pady=(6, 4))
+
+        holder = ttk.Frame(frame)
+        holder.pack(fill="both", expand=True)
+        cols = ("chk", "path")
+        self.etree = ttk.Treeview(holder, columns=cols, show="headings",
+                                  selectmode="extended")
+        self.etree.heading("chk", text="")
+        self.etree.heading("path", text="路径")
+        self.etree.column("chk", width=32, anchor="center", stretch=False)
+        self.etree.column("path", width=740, anchor="w", stretch=True)
+
+        sb = ttk.Scrollbar(holder, orient="vertical", command=self.etree.yview)
+        self.etree.configure(yscrollcommand=sb.set)
+        self.etree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+        self.etree.bind("<Button-1>", self._on_etree_click)
+        self.etree.bind("<space>", self._on_etree_space)
+
+        ttk.Button(frame, text="扫描空文件夹", width=14,
+                   command=self.on_scan_empty).pack(anchor="w", pady=(6, 4))
+
+    # ---------------- 行数据 ----------------
+
+    @staticmethod
+    def _tag_of(t):
+        if t.exists is False:
+            return "missing"
+        if t.level == LEVEL_RISKY:
+            return "risky"
+        if t.need_admin:
+            return "admin"
+        return ""
+
+    @staticmethod
+    def _row_values(t):
+        if t.exists is False:
+            return (UNCHECKED, t.label, PENDING, PENDING, t.note)
+        mark = CHECKED if t.checked else UNCHECKED
+        if t.exists is None:
+            return (mark, t.label, PENDING, PENDING, t.note)
+        note = ("【需管理员】" + t.note) if t.need_admin else t.note
+        return (mark, t.label, human_size(t.size),
+                "{:,}".format(t.files), note)
+
+    # ---------------- 日志与状态 ----------------
+
+    def log(self, msg):
+        self.log_text.insert("end", "[%s] %s\n" % (time.strftime("%H:%M:%S"), msg))
+        self.log_text.see("end")
+
+    def set_status(self, text):
+        self.status.configure(text=text)
+
+    def _refresh_drive_info(self):
+        info = []
+        for letter in "CDEF":
+            u = disk_usage(letter)
+            if u:
+                info.append("%s: 可用 %s / 共 %s"
+                            % (letter, human_size(u[2]), human_size(u[0])))
+        self.drive_label.configure(text="    ".join(info) or "未读取到磁盘信息")
+
+    # ---------------- 勾选 ----------------
+
+    def _find_target(self, iid):
+        for t in self.targets:
+            if t.key == iid:
+                return t
+        return None
+
+    def _toggle_target(self, iids):
+        if isinstance(iids, str):
+            iids = (iids,)
+        for iid in iids:
+            t = self._find_target(iid)
+            if t is None or t.exists is False:
+                continue
+            if t.level == LEVEL_RISKY and not t.checked:
+                from tkinter import messagebox
+                if not messagebox.askyesno(
+                        APP_NAME,
+                        "「%s」有副作用：\n\n%s\n\n确定要勾选吗？" % (t.label, t.note),
+                        parent=self.root):
+                    continue
+            t.checked = not t.checked
+            self._refresh_row(t)
+        self._update_summary()
+
+    def _refresh_row(self, t):
+        try:
+            self.tree.item(t.key, values=self._row_values(t),
+                           tags=(self._tag_of(t),))
+        except Exception:
+            pass
+
+    def _on_tree_click(self, event):
+        if self.tree.identify_region(event.x, event.y) != "cell":
+            return
+        if self.tree.identify_column(event.x) not in ("#1", "#2"):
+            return
+        iid = self.tree.identify_row(event.y)
+        if iid:
+            self._toggle_target(iid)
+
+    def _toggle_empty(self, iid):
+        if iid in self.empty_checked:
+            self.empty_checked.discard(iid)
+            mark = UNCHECKED
+        else:
+            self.empty_checked.add(iid)
+            mark = CHECKED
+        try:
+            vals = list(self.etree.item(iid, "values"))
+            vals[0] = mark
+            self.etree.item(iid, values=vals)
+        except Exception:
+            pass
+        self._update_summary()
+
+    def _on_etree_click(self, event):
+        if self.etree.identify_region(event.x, event.y) != "cell":
+            return
+        if self.etree.identify_column(event.x) not in ("#1", "#2"):
+            return
+        iid = self.etree.identify_row(event.y)
+        if iid:
+            self._toggle_empty(iid)
+
+    def _on_etree_space(self, _event):
+        for iid in self.etree.selection():
+            self._toggle_empty(iid)
+
+    def on_check_all(self):
+        for t in self.targets:
+            if t.exists is not False and t.level != LEVEL_RISKY:
+                t.checked = True
+                self._refresh_row(t)
+        for iid in self.etree.get_children():
+            if iid not in self.empty_checked:
+                self.empty_checked.add(iid)
+                try:
+                    vals = list(self.etree.item(iid, "values"))
+                    vals[0] = CHECKED
+                    self.etree.item(iid, values=vals)
+                except Exception:
+                    pass
+        self._update_summary()
+
+    def on_check_none(self):
+        for t in self.targets:
+            t.checked = False
+            self._refresh_row(t)
+        for iid in list(self.empty_checked):
+            self.empty_checked.discard(iid)
+            try:
+                vals = list(self.etree.item(iid, "values"))
+                vals[0] = UNCHECKED
+                self.etree.item(iid, values=vals)
+            except Exception:
+                pass
+        self._update_summary()
+
+    def _selected_targets(self):
+        return [t for t in self.targets if t.checked and t.exists is not False]
+
+    def _update_summary(self):
+        sel = self._selected_targets()
+        parts = ["已选 %d 项，预计释放 %s"
+                 % (len(sel), human_size(sum(t.size for t in sel)))]
+        if self.empty_checked:
+            parts.append("外加 %d 个空文件夹" % len(self.empty_checked))
+        self.set_status("    ".join(parts))
+        self.btn_clean.configure(
+            state="disabled" if self.busy or not (sel or self.empty_checked)
+            else "normal")
+
+    # ---------------- 扫描 ----------------
+
+    def _set_busy(self, busy):
+        self.busy = busy
+        state = "disabled" if busy else "normal"
+        for w in (self.btn_scan, self.btn_all, self.btn_none):
+            w.configure(state=state)
+        self.btn_clean.configure(
+            state="disabled" if busy or not (self._selected_targets()
+                                             or self.empty_checked) else "normal")
+
+    def on_scan(self):
+        if self.busy:
+            return
+        self._set_busy(True)
+        self.set_status("正在扫描 ...")
+        self.log("开始扫描（只读，不会删除任何东西）")
+        self.cancel.clear()
+
+        def work():
+            try:
+
+                def prog(t):
+                    self.msgq.put(("row", t))
+                    self.msgq.put(("status", "已扫描：%s — %s"
+                                   % (t.label, human_size(t.size))))
+
+                # 回收站统计偏慢，单独开线程，别拖住其他不到一秒的项目
+                rb_targets = [t for t in self.targets if t.mode == "recyclebin"]
+                others = [t for t in self.targets if t.mode != "recyclebin"]
+
+                if rb_targets:
+                    self.msgq.put(("status", "正在统计回收站 ..."))
+
+                    def rb_work():
+                        for t in rb_targets:
+                            try:
+                                b, n = measure_recyclebin()
+                                t.exists = True
+                                t.size, t.files = b, n
+                                t.errcount = 0
+                                self.msgq.put(("row", t))
+                            except Exception:  # noqa: BLE001
+                                pass
+                        self.msgq.put(("rb_done", None))
+
+                    threading.Thread(target=rb_work, daemon=True).start()
+
+                scan_targets(others, progress=prog, cancel=self.cancel)
+                self.msgq.put(("scan_done", bool(rb_targets)))
+            except Exception as exc:  # noqa: BLE001
+                self.msgq.put(("error", "扫描失败：%s" % exc))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_scan_empty(self):
+        if self.busy:
+            return
+        self._set_busy(True)
+        self.set_status("正在扫描空文件夹 ...")
+        self.log("开始扫描空文件夹（系统目录已排除，只读）")
+        self.cancel.clear()
+
+        def work():
+            try:
+                found = scan_empty_dirs(
+                    progress=lambda n: self.msgq.put(
+                        ("status", "已找到 %d 个空文件夹 ..." % n)),
+                    cancel=self.cancel)
+                self.msgq.put(("empty_done", found))
+            except Exception as exc:  # noqa: BLE001
+                self.msgq.put(("error", "扫描空文件夹失败：%s" % exc))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    # ---------------- 清理 ----------------
+
+    def on_clean(self):
+        if self.busy:
+            return
+        sel = self._selected_targets()
+        empty_sel = list(self.empty_checked)
+        if not sel and not empty_sel:
+            from tkinter import messagebox
+            messagebox.showinfo(APP_NAME, "还没有勾选任何项目。", parent=self.root)
+            return
+
+        mode = "送进回收站" if self.use_recyclebin.get() else "永久删除"
+        lines = ["即将%s以下内容：" % mode, ""]
+        for t in sel:
+            lines.append("  · %-16s %10s" % (t.label, human_size(t.size)))
+        if empty_sel:
+            lines.append("  · %-16s %10d 个" % ("空文件夹", len(empty_sel)))
+        lines.append("")
+        lines.append("合计约 %s" % human_size(sum(t.size for t in sel)))
+        lines.append("")
+        if self.use_recyclebin.get():
+            lines.append("注意：送回收站不会立刻释放磁盘空间，")
+            lines.append("要之后再清空回收站才算真正腾出空间。")
+        else:
+            lines.append("永久删除不可撤销，文件不会进回收站。")
+
+        from tkinter import messagebox
+        if not messagebox.askyesno(APP_NAME, "\n".join(lines), parent=self.root):
+            self.log("已取消")
+            return
+
+        self._set_busy(True)
+        self.cancel.clear()
+
+        def work():
+            cleared = []
+            freed = files = failed = 0
+            for t in sel:
+                if self.cancel.is_set():
+                    break
+                self.msgq.put(("log", "清理：%s" % t.label))
+                b, f, e = clear_target(t, use_recyclebin=self.use_recyclebin.get(),
+                                       log=lambda m: self.msgq.put(("log", m)))
+                freed += b
+                files += f
+                failed += e
+                cleared.append(t)
+                self.msgq.put(("log", "  → 释放 %s，处理 %d 个文件%s"
+                               % (human_size(b), f,
+                                  ("，%d 项未成功" % e) if e else "")))
+
+            if empty_sel and not self.cancel.is_set():
+                self.msgq.put(("log", "清理空文件夹 %d 个" % len(empty_sel)))
+                for d in empty_sel:
+                    if self.cancel.is_set():
+                        break
+                    dn = norm(d)
+                    if any(dn == p or dn.startswith(p + os.sep)
+                           for p in PROTECTED_ROOTS):
+                        failed += 1
+                        self.msgq.put(("log", "  [拒绝] 位于保护区：%s" % d))
+                        continue
+                    try:
+                        if os.path.isdir(d) and is_empty_dir(d):
+                            os.rmdir(d)
+                            self.msgq.put(("eempty", d))
+                    except OSError as exc:
+                        failed += 1
+                        self.msgq.put(("log", "  [失败] %s：%s" % (d, exc)))
+
+            self.msgq.put(("clean_done", (freed, files, failed, cleared)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    # ---------------- 消息泵 ----------------
+
+    def _drain_queue(self):
+        if not self.alive:
+            return
+        try:
+            while True:
+                kind, payload = self.msgq.get_nowait()
+
+                if kind == "log":
+                    self.log(payload)
+                elif kind == "status":
+                    self.set_status(payload)
+                elif kind == "row":
+                    self._refresh_row(payload)
+                elif kind == "scan_done":
+                    self._refresh_drive_info()
+                    total = sum(t.size for t in self._selected_targets())
+                    self.log("扫描完成。勾选项合计 %s" % human_size(total))
+                    if payload:
+                        self.log("回收站项数较多，正在后台统计 ...")
+                    else:
+                        self._set_busy(False)
+                    self._update_summary()
+                elif kind == "rb_done":
+                    self._set_busy(False)
+                    rb = [t for t in self.targets if t.mode == "recyclebin"]
+                    if rb:
+                        self.log("回收站统计完成：%s / %d 项"
+                                 % (human_size(rb[0].size), rb[0].files))
+                    self._refresh_drive_info()
+                    self._update_summary()
+                elif kind == "empty_done":
+                    self._set_busy(False)
+                    self.empty_checked.clear()
+                    self.etree.delete(*self.etree.get_children())
+                    for i, d in enumerate(payload):
+                        self.etree.insert("", "end", iid="e%d" % i,
+                                          values=(UNCHECKED, d))
+                    self.log("空文件夹扫描完成：找到 %d 个（默认不勾选）" % len(payload))
+                    self._update_summary()
+                elif kind == "eempty":
+                    try:
+                        self.etree.delete(payload)
+                    except Exception:
+                        pass
+                elif kind == "clean_done":
+                    freed, files, failed, cleared = payload
+                    self._set_busy(False)
+                    self._refresh_drive_info()
+                    for t in cleared:
+                        t.checked = False
+                        if t.mode != "recyclebin":
+                            t.size, t.files = 0, 0
+                        self._refresh_row(t)
+                    self.log("清理完成：释放 %s，处理 %d 个文件%s"
+                             % (human_size(freed), files,
+                                ("，%d 项未成功（多被占用）" % failed) if failed else ""))
+                    if self.use_recyclebin.get() and freed:
+                        self.log("提示：这些内容现在还在回收站里占着空间，"
+                                 "需要清空回收站才真正释放。")
+                    self.log("点「扫描」可刷新最新数据。")
+                    self.set_status("清理完成，释放 %s" % human_size(freed))
+                elif kind == "error":
+                    self._set_busy(False)
+                    self.log("[错误] %s" % payload)
+
+        except queue.Empty:
+            pass
+        self.root.after(120, self._drain_queue)
+
+    # ---------------- 结束 ----------------
+
+    def _on_close(self):
+        if self.busy:
+            from tkinter import messagebox
+            if not messagebox.askyesno(APP_NAME, "还有任务在运行，确定退出吗？",
+                                       parent=self.root):
+                return
+            self.cancel.set()
+        self.alive = False
+        self.root.destroy()
+
+
+# ---------------------------------------------------------------- 入口
+
+def _fatal(msg, title=APP_NAME):
+    """没 tkinter 时的兜底提示，走原生消息框。"""
+    try:
+        ctypes.windll.user32.MessageBoxW(None, msg, title, 0x10)
+    except Exception:
+        sys.stderr.write(msg + "\n")
+
+
+def main():
+    global tk
+
+    if not IS_WINDOWS:
+        _fatal("本工具仅支持 Windows。")
+        return 1
+
+    try:
+        import tkinter as _tk
+        from tkinter import ttk  # noqa: F401
+    except ImportError:
+        _fatal("当前 Python 缺少 tkinter 组件，界面无法启动。\n\n"
+               "两种办法：\n"
+               "  1. 换用带 tcl/tk 的 Python 运行\n"
+               "  2. 直接下载打包好的 exe\n")
+        return 1
+
+    tk = _tk
+    _enable_dpi_awareness()
+    root = tk.Tk()
+    CleanerApp(root)
+    root.mainloop()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

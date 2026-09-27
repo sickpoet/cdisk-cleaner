@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 打包产物（由 build_exe.py 生成，不入库）
+build/
+dist/
+*.spec
+version_info.txt
+
+.venv/
+venv/
+env/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
