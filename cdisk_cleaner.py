@@ -15,7 +15,7 @@ C 盘垃圾清理器
 只用标准库，零第三方依赖。
 """
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 APP_NAME = "C 盘垃圾清理器"
 
 import ctypes
@@ -117,8 +117,21 @@ def is_admin():
 
 # ---------------------------------------------------------------- 路径守卫
 
+_USER_PROFILES = None
+
+
 def _local_user_profiles():
-    """列出本机所有本地用户的主目录。"""
+    """
+    列出本机所有本地用户的主目录。
+
+    结果只算一次就缓存住。guard() 每次校验都要用它，而清理一个几万条目的
+    临时目录会调用 guard() 几万次——实测每次 scandir C:\\Users 约 0.086 ms，
+    占了 guard() 总开销的 77%（单次 0.111 ms），纯属白烧。
+    """
+    global _USER_PROFILES
+    if _USER_PROFILES is not None:
+        return _USER_PROFILES
+
     out = []
     users_root = os.path.join(SYSTEM_DRIVE + os.sep, "Users")
     if os.path.isdir(users_root):
@@ -456,33 +469,6 @@ def _measure(root, pattern=None):
     return total, files, errs
 
 
-class SHQUERYRBINFO(ctypes.Structure):
-    _fields_ = [
-        ("cbSize", wintypes.DWORD),
-        ("i64Size", ctypes.c_longlong),
-        ("i64NumItems", ctypes.c_longlong),
-    ]
-
-
-def query_recyclebin(drive=None):
-    """
-    用系统 API 查询回收站大小与条目数，比遍历文件系统快几个数量级。
-    drive 传 None 表示所有盘。返回 (字节数, 条目数)。
-    """
-    info = SHQUERYRBINFO()
-    info.cbSize = ctypes.sizeof(info)
-    try:
-        fn = ctypes.windll.shell32.SHQueryRecycleBinW
-        fn.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(SHQUERYRBINFO)]
-        fn.restype = ctypes.c_long
-        rc = fn(drive, ctypes.byref(info))
-        if rc == 0:
-            return max(info.i64Size, 0), max(info.i64NumItems, 0)
-    except Exception:
-        pass
-    return 0, 0
-
-
 def measure_recyclebin():
     """
     遍历回收站的数据目录统计大小。
@@ -583,26 +569,36 @@ def _send_to_recyclebin(paths):
     if not paths:
         return 0, []
 
+    co_ready = False
     try:
         ctypes.windll.ole32.CoInitialize(None)
+        co_ready = True
     except Exception:
         pass
 
-    buf = ctypes.create_unicode_buffer("\0".join(paths) + "\0\0")
-    op = SHFILEOPSTRUCTW()
-    ctypes.memset(ctypes.byref(op), 0, ctypes.sizeof(op))
-    op.wFunc = FO_DELETE
-    op.pFrom = ctypes.cast(buf, wintypes.LPCWSTR)
-    op.fFlags = (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI
-                 | FOF_SILENT | FOF_MULTIDESTFILES)
+    try:
+        buf = ctypes.create_unicode_buffer("\0".join(paths) + "\0\0")
+        op = SHFILEOPSTRUCTW()
+        ctypes.memset(ctypes.byref(op), 0, ctypes.sizeof(op))
+        op.wFunc = FO_DELETE
+        op.pFrom = ctypes.cast(buf, wintypes.LPCWSTR)
+        op.fFlags = (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI
+                     | FOF_SILENT | FOF_MULTIDESTFILES)
 
-    shell32 = ctypes.windll.shell32
-    shell32.SHFileOperationW.argtypes = [ctypes.POINTER(SHFILEOPSTRUCTW)]
-    shell32.SHFileOperationW.restype = ctypes.c_int
-    shell32.SHFileOperationW(ctypes.byref(op))
+        shell32 = ctypes.windll.shell32
+        shell32.SHFileOperationW.argtypes = [ctypes.POINTER(SHFILEOPSTRUCTW)]
+        shell32.SHFileOperationW.restype = ctypes.c_int
+        shell32.SHFileOperationW(ctypes.byref(op))
 
-    survivors = [p for p in paths if os.path.exists(p)]
-    return len(paths) - len(survivors), survivors
+        survivors = [p for p in paths if os.path.exists(p)]
+        return len(paths) - len(survivors), survivors
+    finally:
+        # CoInitialize 要配对的 CoUninitialize，否则每次调用都往计数上加
+        if co_ready:
+            try:
+                ctypes.windll.ole32.CoUninitialize()
+            except Exception:
+                pass
 
 
 def _rmtree_force(path):
@@ -628,7 +624,12 @@ def _rmtree_force(path):
 
 
 def empty_recyclebin():
-    """清空回收站。不可逆。返回是否调用成功。"""
+    """
+    清空回收站。不可逆。
+
+    SHEmptyRecycleBinW 成功返回 S_OK(0)，回收站本来就是空的返回 S_FALSE(1)，
+    两者都算成功；其它才是真失败。以前无条件 return True，失败也报成功。
+    """
     try:
         fn = ctypes.windll.shell32.SHEmptyRecycleBinW
         fn.argtypes = [wintypes.HWND, wintypes.LPCWSTR, wintypes.DWORD]
@@ -636,8 +637,9 @@ def empty_recyclebin():
         SHERB_NOCONFIRMATION = 0x1
         SHERB_NOPROGRESSUI = 0x2
         SHERB_NOSOUND = 0x4
-        fn(None, None, SHERB_NOCONFIRMATION | SHERB_NOPROGRESSUI | SHERB_NOSOUND)
-        return True
+        rc = fn(None, None,
+                SHERB_NOCONFIRMATION | SHERB_NOPROGRESSUI | SHERB_NOSOUND)
+        return rc in (0, 1)
     except Exception:
         return False
 
@@ -697,7 +699,7 @@ def _clear_one_root(root, target, use_recyclebin, log):
 
     if use_recyclebin:
         _ok, survivors = _send_to_recyclebin(safe)
-        failed += len(survivors)
+        leftovers = survivors
         if log and survivors:
             log("  %d 项未能送入回收站（多被占用或权限不足）" % len(survivors))
     else:
@@ -705,20 +707,40 @@ def _clear_one_root(root, target, use_recyclebin, log):
             try:
                 _rmtree_force(v)
             except OSError as exc:
-                failed += 1
                 if log:
                     log("  [失败] %s：%s" % (os.path.basename(v), exc))
+        # _rmtree_force 里 shutil.rmtree(onerror=...) 会把子项错误吞掉，
+        # 只看有没有抛异常，会把「根本没删掉」报成成功。回头查一遍残留。
+        leftovers = [v for v in safe if os.path.exists(v)]
+        if log and leftovers:
+            log("  %d 项未删净（多被占用或权限不足）" % len(leftovers))
 
-    return freed, removed_files, failed
+    if leftovers:
+        failed += len(leftovers)
+        # 没删掉的要从战果里扣回来，否则报出来的「释放 X」是虚的
+        for v in leftovers:
+            try:
+                if os.path.isfile(v):
+                    freed -= os.path.getsize(v)
+                    removed_files -= 1
+                elif os.path.isdir(v):
+                    b, f, _ = _measure(v)
+                    freed -= b
+                    removed_files -= f
+            except OSError:
+                pass
+
+    return max(freed, 0), max(removed_files, 0), failed
 
 
 def clear_target(target, use_recyclebin=False, log=None):
     """清空一个目标。返回 (释放字节, 删除文件数, 失败项数)。"""
     if target.mode == "recyclebin":
-        before, _n = measure_recyclebin()
+        # 扫描时已经量过了，别再遍历一遍（16 万项要 6 秒）
+        before = target.size if target.exists else measure_recyclebin()[0]
         ok = empty_recyclebin()
         if not ok and log:
-            log("  清空回收站调用失败")
+            log("  清空回收站失败（被占用或权限不足）")
         return before, 0, 0 if ok else 1
 
     freed = files = failed = 0
@@ -836,6 +858,10 @@ TEXT_OFF  = "#243845"   # 禁用
 
 FONT_EN = "Consolas"            # 数字与西文，等宽
 FONT_UI = "Microsoft YaHei UI"  # 中文
+
+TITLEBAR_H = 40                 # 自绘标题栏高度
+RESIZE_EDGE = 6                 # 边缘缩放的拖动热区宽度
+MIN_WIN = (920, 668)            # 窗口最小尺寸
 
 
 def _mix(color, factor):
@@ -1191,20 +1217,33 @@ class CleanerApp(object):
         pick_fonts(root)
         _set_window_icon(root)
         root.title("%s  ::  v%s" % (APP_NAME, __version__))
-        root.configure(bg=BG)
+        # 根窗口底色当窗口外框用：内容区四周留 1px 露出它
+        root.configure(bg=BORDER_HI)
         root.geometry("1000x772")
-        root.minsize(920, 668)
+        root.minsize(*MIN_WIN)
+
+        # 无边框窗口的状态
+        self._maxed = False
+        self._restore_geo = None
+        self._drag_off = None
+        self._resizing = None
+        self._frameless = False
+        self._minimizing = False
+        self._cur_cursor = ""
 
         # 顶部仪表盘要用到的动态文本句柄，_draw_head() 之后才有值
         self._drive_item = None
         self._drive_sub = None
         self._drive_others = None
         self._head_w = 0
-        self._head_h = 88
+        self._head_h = 58
         self._blink_on = True
 
-        apply_dark_titlebar(root)
         setup_style(root)
+        self._go_frameless()
+        if not self._frameless:
+            # 极少见：无边框没设上，退回原生边框，至少把标题栏切深色
+            apply_dark_titlebar(root)
         self._build_ui()
         self._refresh_drive_info()
         self.log("就绪。扫描过程只读，不会删任何东西。")
@@ -1214,9 +1253,9 @@ class CleanerApp(object):
 
         self.root.after(120, self._drain_queue)
         self.root.after(620, self._tick_blink)
-        # 窗口真正映射之后再补设一次标题栏颜色：首次调用时 HWND 还没定型
-        self.root.after(90, lambda: apply_dark_titlebar(root))
-        self.root.after(600, lambda: apply_dark_titlebar(root))
+        if not self._frameless:
+            self.root.after(90, lambda: apply_dark_titlebar(root))
+            self.root.after(600, lambda: apply_dark_titlebar(root))
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         if autoscan:
             self.root.after(400, self.on_scan)
@@ -1226,17 +1265,33 @@ class CleanerApp(object):
     def _build_ui(self):
         from tkinter import ttk
 
-        pad = tk.Frame(self.root, bg=BG)
-        pad.pack(fill="both", expand=True, padx=14, pady=(10, 12))
+        # --- 自绘标题栏。无边框窗口全靠它：拖动、缩放、最小化/最大化/关闭
+        self.tb = tk.Canvas(self.root, height=TITLEBAR_H, bg=BG_DEEP,
+                            highlightthickness=0, bd=0)
+        self.tb.pack(fill="x", side="top", padx=1, pady=(1, 0))
+        self.tb.bind("<Configure>", self._on_titlebar_resize)
+        self.tb.bind("<Button-1>", self._drag_begin)
+        self.tb.bind("<B1-Motion>", self._drag_move)
+        self.tb.bind("<ButtonRelease-1>", self._drag_end)
+        # 双击标题栏最大化/还原，沿用系统习惯
+        self.tb.bind("<Double-Button-1>", lambda _e: self._toggle_max())
 
-        # --- 顶部仪表盘：标题、版本、磁盘读数
-        self.head = tk.Canvas(pad, height=self._head_h, bg=BG,
+        pad = tk.Frame(self.root, bg=BG)
+        pad.pack(fill="both", expand=True, padx=1, pady=(0, 1))
+
+        # root 背景色是 BORDER_HI，上面两个 padx/pady=1 让它在四周露出一圈，
+        # 充当窗口外框——无边框窗口没有系统阴影，需要一条线界定边界
+        body = tk.Frame(pad, bg=BG)
+        body.pack(fill="both", expand=True, padx=14, pady=(10, 12))
+
+        # --- 顶部仪表盘：磁盘读数
+        self.head = tk.Canvas(body, height=self._head_h, bg=BG,
                               highlightthickness=0, bd=0)
         self.head.pack(fill="x")
         self.head.bind("<Configure>", self._on_head_resize)
 
         # --- 操作条
-        bar = tk.Frame(pad, bg=BG)
+        bar = tk.Frame(body, bg=BG)
         bar.pack(fill="x", pady=(13, 10))
 
         self.btn_scan = NeonButton(bar, "SCAN · 扫描", self.on_scan,
@@ -1267,12 +1322,12 @@ class CleanerApp(object):
                   color=CYAN).pack(side="left", padx=(14, 0))
 
         # --- 主体（先创建不 pack，pack 顺序见本节末尾）
-        self.nb = ttk.Notebook(pad, style="Cyber.TNotebook")
+        self.nb = ttk.Notebook(body, style="Cyber.TNotebook")
         self._build_targets_tab()
         self._build_empty_tab()
 
         # --- 日志
-        log_head = tk.Frame(pad, bg=BG)
+        log_head = tk.Frame(body, bg=BG)
         tk.Frame(log_head, bg=CYAN, width=3, height=14).pack(side="left")
         tk.Label(log_head, text="LOG // 运行日志", bg=BG, fg=CYAN,
                  font=(FONT_EN, 10, "bold")).pack(side="left", padx=(8, 0))
@@ -1280,7 +1335,7 @@ class CleanerApp(object):
                    width=66, height=24, color=TEXT_DIM,
                    font=(FONT_EN, 9, "bold")).pack(side="right")
 
-        logf = tk.Frame(pad, bg=BG)
+        logf = tk.Frame(body, bg=BG)
         self.log_text = tk.Text(
             logf, height=6, wrap="none", font=(FONT_EN, 9),
             bg=BG_DEEP, fg=TEXT, insertbackground=CYAN, relief="flat",
@@ -1296,7 +1351,7 @@ class CleanerApp(object):
         sb.pack(side="right", fill="y")
 
         # --- 状态条
-        statusbar = tk.Frame(pad, bg=PANEL, highlightthickness=1,
+        statusbar = tk.Frame(body, bg=PANEL, highlightthickness=1,
                              highlightbackground=BORDER)
         self._status_accent = tk.Frame(statusbar, bg=CYAN, width=3)
         self._status_accent.pack(side="left", fill="y")
@@ -1312,7 +1367,15 @@ class CleanerApp(object):
         log_head.pack(side="bottom", fill="x", pady=(13, 5))
         self.nb.pack(side="top", fill="both", expand=True)
 
+        # 边缘缩放：子控件会吃掉落在自己身上的 <Motion>，所以挂到 bind_all
+        self.root.bind_all("<Motion>", self._on_win_motion, add="+")
+        self.root.bind_all("<Button-1>", self._on_win_press, add="+")
+        self.root.bind_all("<B1-Motion>", self._on_win_drag, add="+")
+        self.root.bind_all("<ButtonRelease-1>", self._on_win_release, add="+")
+
         self.root.after(30, self._draw_head)
+        self.root.after(30, self._draw_titlebar)
+        self.root.after(60, self._center_window)
 
     # ---------------- 顶部仪表盘绘制 ----------------
 
@@ -1329,38 +1392,25 @@ class CleanerApp(object):
         h = self._head_h
         self.head.delete("all")
 
-        # 网格底纹：只画竖线，横线会正好穿过标题区的几行字
+        # 网格底纹：只画竖线，横线会正好穿过文字
         for x in range(0, w + 24, 24):
             self.head.create_line(x, 0, x, h, fill=GRID, tags="grid")
         self.head.tag_lower("grid")
 
-        self.head.create_rectangle(0, 14, 3, h - 24, fill=CYAN, outline="")
-        self._blink = self.head.create_rectangle(14, 16, 23, 31, fill=CYAN,
-                                                 outline="")
-
-        # 标题：先画一层暗色副本做假阴影
-        self.head.create_text(31, 25, text="CDISK//CLEANER", anchor="w",
-                              fill=_mix(CYAN, 0.30), font=(FONT_EN, 20, "bold"))
-        self.head.create_text(30, 23, text="CDISK//CLEANER", anchor="w",
-                              fill=CYAN, font=(FONT_EN, 20, "bold"))
-
-        self.head.create_text(w - 2, 19, text="v" + __version__, anchor="e",
-                              fill=MAGENTA, font=(FONT_EN, 11, "bold"))
-        self.head.create_text(w - 2, 37, text="WHITELIST MODE · 白名单制",
-                              anchor="e", fill=TEXT_DIM, font=(FONT_EN, 8))
-
-        self.head.create_text(14, 48, anchor="w", fill=TEXT_DIM,
-                              font=(FONT_UI, 9),
-                              text="只清理人工审核过的目标，清单之外的路径一律不碰")
+        self.head.create_rectangle(0, 8, 3, h - 19, fill=CYAN, outline="")
 
         # 磁盘读数（动态更新，见 _refresh_drive_info）
         self._drive_item = self.head.create_text(
-            14, 70, anchor="w", text="正在读取磁盘信息 ...", fill=GREEN,
-            font=(FONT_EN, 13, "bold"))
+            14, 18, anchor="w", text="正在读取磁盘信息 ...", fill=GREEN,
+            font=(FONT_EN, 14, "bold"))
         self._drive_sub = self.head.create_text(
-            196, 72, anchor="w", text="", fill=TEXT_DIM, font=(FONT_UI, 9))
+            206, 21, anchor="w", text="", fill=TEXT_DIM, font=(FONT_UI, 9))
         self._drive_others = self.head.create_text(
-            w - 2, 72, anchor="e", text="", fill=TEXT_DIM, font=(FONT_EN, 9))
+            w - 2, 21, anchor="e", text="", fill=TEXT_DIM, font=(FONT_EN, 9))
+
+        self.head.create_text(14, 42, anchor="w", fill=TEXT_DIM,
+                              font=(FONT_UI, 9),
+                              text="只清理人工审核过的目标，清单之外的路径一律不碰")
 
         # 底部霓虹分割线
         self.head.create_line(0, h - 2, w, h - 2, fill=BORDER)
@@ -1369,17 +1419,313 @@ class CleanerApp(object):
 
         self._refresh_drive_info()
 
+    # ---------------- 自绘标题栏 ----------------
+
+    def _on_titlebar_resize(self, event):
+        if abs(event.width - getattr(self, "_tb_w", 0)) < 2:
+            return
+        self._tb_w = event.width
+        self._draw_titlebar()
+
+    def _draw_titlebar(self):
+        w = getattr(self, "_tb_w", 0) or self.tb.winfo_width()
+        if w < 80:
+            return
+        h = TITLEBAR_H
+        self.tb.delete("all")
+        self.tb.configure(bg=BG_DEEP)
+        self._tb_btns = {}
+
+        # 品牌竖条
+        self.tb.create_rectangle(0, 0, 3, h, fill=CYAN, outline="")
+        # 闪烁方块
+        self._blink = self.tb.create_rectangle(14, 15, 23, 26, fill=CYAN,
+                                               outline="")
+
+        # 标题（一层暗色副本做假阴影）
+        self.tb.create_text(32, 21, text="CDISK//CLEANER", anchor="w",
+                            fill=_mix(CYAN, 0.30), font=(FONT_EN, 15, "bold"))
+        self.tb.create_text(31, 20, text="CDISK//CLEANER", anchor="w",
+                            fill=CYAN, font=(FONT_EN, 15, "bold"))
+
+        try:
+            from tkinter import font as tkfont
+            tw = tkfont.Font(font=(FONT_EN, 15, "bold")).measure("CDISK//CLEANER")
+        except Exception:
+            tw = 140
+        self.tb.create_text(31 + tw + 16, 21, text="v" + __version__, anchor="w",
+                            fill=MAGENTA, font=(FONT_EN, 10, "bold"))
+        self.tb.create_text(31 + tw + 78, 21, text="WHITELIST MODE", anchor="w",
+                            fill=TEXT_DIM, font=(FONT_EN, 8))
+
+        # 右侧三个窗口按钮
+        bw = 46
+        x = w - bw * 3
+        self.tb.create_line(x, 8, x, h - 8, fill=BORDER)
+        self._tb_button("min", x, bw, h)
+        self._tb_button("max", x + bw, bw, h)
+        self._tb_button("close", x + bw * 2, bw, h)
+
+    def _tb_button(self, kind, x, bw, h):
+        """画一个标题栏按钮，并记下 item id 好在悬停时改色。"""
+        hot = MAGENTA if kind == "close" else CYAN
+        rect = self.tb.create_rectangle(x + 1, 1, x + bw - 1, h - 1,
+                                        fill=BG_DEEP, outline="", tags=kind)
+        cx, cy = x + bw / 2.0, h / 2.0
+        marks = []
+        if kind == "min":
+            marks.append(self.tb.create_line(cx - 6, cy + 4, cx + 6, cy + 4,
+                                             fill=TEXT_DIM, width=1, tags=kind))
+        elif kind == "max":
+            marks.append(self.tb.create_rectangle(cx - 5, cy - 5, cx + 5, cy + 5,
+                                                  outline=TEXT_DIM, width=1,
+                                                  tags=kind))
+        else:
+            marks.append(self.tb.create_line(cx - 5, cy - 5, cx + 5, cy + 5,
+                                             fill=TEXT_DIM, width=1, tags=kind))
+            marks.append(self.tb.create_line(cx + 5, cy - 5, cx - 5, cy + 5,
+                                             fill=TEXT_DIM, width=1, tags=kind))
+
+        self._tb_btns[kind] = (rect, marks, hot)
+
+        def enter(_e, k=kind):
+            r, ms, c = self._tb_btns[k]
+            self.tb.itemconfigure(r, fill=_mix(c, 0.22))
+            for m in ms:
+                self.tb.itemconfigure(m, fill="#ffffff")
+
+        def leave(_e, k=kind):
+            r, ms, c = self._tb_btns[k]
+            self.tb.itemconfigure(r, fill=BG_DEEP)
+            for m in ms:
+                self.tb.itemconfigure(m, fill=TEXT_DIM)
+
+        self.tb.tag_bind(kind, "<Enter>", enter)
+        self.tb.tag_bind(kind, "<Leave>", leave)
+
+        action = {"min": self._minimize, "max": self._toggle_max,
+                  "close": self._on_close}[kind]
+        # 返回 "break"：别让 tag 上的点击再冒泡到整条标题栏的拖动处理
+        self.tb.tag_bind(kind, "<Button-1>", lambda _e, f=action: (f(), "break")[1])
+
     def _tick_blink(self):
-        """标题旁的小方块来回变色，让界面看起来「在工作」。"""
+        """标题栏的小方块来回变色，让界面看起来「在工作」。"""
         if not self.alive:
             return
         self._blink_on = not self._blink_on
         try:
-            self.head.itemconfigure(self._blink,
-                                    fill=CYAN if self._blink_on else "#0d3b47")
+            self.tb.itemconfigure(self._blink,
+                                  fill=CYAN if self._blink_on else "#0d3b47")
         except Exception:
             pass
         self.root.after(620, self._tick_blink)
+
+    # ---------------- 无边框窗口 ----------------
+    #
+    # overrideredirect(True) 去掉整个系统边框，顺带丢掉三样东西：
+    # 任务栏图标、最小化、边缘缩放。三者都得自己补回来。
+
+    def _go_frameless(self):
+        try:
+            self.root.overrideredirect(True)
+            self._frameless = True
+        except Exception:
+            self._frameless = False
+        self._apply_appwindow()
+
+    def _apply_appwindow(self):
+        """
+        补任务栏图标。
+
+        overrideredirect 会把窗口变成 WS_POPUP 并带上 WS_EX_TOOLWINDOW，
+        结果从任务栏和 Alt+Tab 里一起消失。加回 WS_EX_APPWINDOW 让它回来。
+        """
+        try:
+            self.root.update_idletasks()
+            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+            if not hwnd:
+                return
+            GWL_EXSTYLE = -20
+            WS_EX_TOOLWINDOW = 0x00000080
+            WS_EX_APPWINDOW = 0x00040000
+            get = ctypes.windll.user32.GetWindowLongW
+            setw = ctypes.windll.user32.SetWindowLongW
+            get.restype = ctypes.c_long
+            setw.restype = ctypes.c_long
+            style = get(hwnd, GWL_EXSTYLE)
+            setw(hwnd, GWL_EXSTYLE, (style & ~WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW)
+        except Exception:
+            pass
+
+    def _minimize(self):
+        """
+        overrideredirect 的窗口不能直接 iconify——会报
+        "can't iconify ...: override-redirect flag is set"。
+        先把边框恢复回去再最小化，之后轮询等它回来，再把边框去掉。
+        """
+        try:
+            self.root.overrideredirect(False)
+            self.root.iconify()
+        except Exception:
+            self._restore_frameless()
+            return
+        self.root.after(200, self._watch_restore)
+
+    def _watch_restore(self):
+        """
+        等窗口从最小化恢复。
+
+        不监听 <Map>：deiconify 时它不一定触发（实测就没触发），
+        而 <Map> 又会被 overrideredirect(False) 自己触发一次，混在一起没法区分。
+        直接查状态反而最稳。
+        """
+        if not self.alive:
+            return
+        try:
+            iconic = (self.root.state() == "iconic")
+        except Exception:
+            iconic = False
+        if iconic:
+            self.root.after(200, self._watch_restore)
+            return
+        self._restore_frameless()
+
+    def _restore_frameless(self):
+        try:
+            self.root.overrideredirect(True)
+        except Exception:
+            return
+        self._apply_appwindow()
+
+    @staticmethod
+    def _work_area():
+        """屏幕工作区（去掉任务栏）。最大化时用。"""
+        r = wintypes.RECT()
+        try:
+            ctypes.windll.user32.SystemParametersInfoW(
+                0x0030, 0, ctypes.byref(r), 0)   # SPI_GETWORKAREA
+            return r.left, r.top, r.right, r.bottom
+        except Exception:
+            return 0, 0, 1920, 1080
+
+    def _center_window(self):
+        """把窗口摆到工作区中央偏上的位置。"""
+        try:
+            left, top, right, bottom = self._work_area()
+            w, h = self.root.winfo_width(), self.root.winfo_height()
+            x = max(left, left + (right - left - w) // 2)
+            y = max(top, top + (bottom - top - h) // 3)
+            self.root.geometry("+%d+%d" % (x, y))
+        except Exception:
+            pass
+
+    def _toggle_max(self):
+        if self._maxed:
+            if self._restore_geo:
+                self.root.geometry(self._restore_geo)
+            self._maxed = False
+        else:
+            self._restore_geo = self.root.geometry()
+            left, top, right, bottom = self._work_area()
+            self.root.geometry("%dx%d+%d+%d"
+                               % (right - left, bottom - top, left, top))
+            self._maxed = True
+        self.root.after(20, self._draw_titlebar)
+
+    # ---- 拖动移动（抓标题栏空白处）
+
+    def _drag_begin(self, event):
+        if self._maxed:
+            return
+        self._drag_off = (event.x_root - self.root.winfo_x(),
+                          event.y_root - self.root.winfo_y())
+
+    def _drag_move(self, event):
+        if self._drag_off is None or self._maxed:
+            return
+        dx, dy = self._drag_off
+        self.root.geometry("+%d+%d" % (event.x_root - dx, event.y_root - dy))
+
+    def _drag_end(self, _event):
+        self._drag_off = None
+
+    # ---- 边缘缩放
+
+    CURSORS = {"n": "size_ns", "s": "size_ns", "w": "size_we", "e": "size_we",
+               "nw": "size_nw_se", "se": "size_nw_se",
+               "ne": "size_ne_sw", "sw": "size_ne_sw"}
+
+    def _edge_at(self, x_root, y_root):
+        if self._maxed or not self._frameless:
+            return None
+        x = x_root - self.root.winfo_rootx()
+        y = y_root - self.root.winfo_rooty()
+        w, h = self.root.winfo_width(), self.root.winfo_height()
+        e = RESIZE_EDGE
+        if x < -2 or y < -2 or x > w + 2 or y > h + 2:
+            return None
+        left, right = x < e, x >= w - e
+        top, bottom = y < e, y >= h - e
+        if top and left:
+            return "nw"
+        if top and right:
+            return "ne"
+        if bottom and left:
+            return "sw"
+        if bottom and right:
+            return "se"
+        if top:
+            return "n"
+        if bottom:
+            return "s"
+        if left:
+            return "w"
+        if right:
+            return "e"
+        return None
+
+    def _on_win_motion(self, event):
+        if self._resizing or self._drag_off:
+            return
+        edge = self._edge_at(event.x_root, event.y_root)
+        want = self.CURSORS.get(edge, "")
+        if want == self._cur_cursor:
+            return          # 鼠标每动一像素就调一次 configure 是白费
+        self._cur_cursor = want
+        try:
+            self.root.configure(cursor=want)
+        except Exception:
+            pass
+
+    def _on_win_press(self, event):
+        edge = self._edge_at(event.x_root, event.y_root)
+        if not edge:
+            return
+        self._resizing = (edge, event.x_root, event.y_root,
+                          self.root.winfo_x(), self.root.winfo_y(),
+                          self.root.winfo_width(), self.root.winfo_height())
+
+    def _on_win_drag(self, event):
+        if not self._resizing:
+            return
+        edge, sx, sy, ox, oy, ow, oh = self._resizing
+        dx, dy = event.x_root - sx, event.y_root - sy
+        x, y, w, h = ox, oy, ow, oh
+        if "e" in edge:
+            w = max(MIN_WIN[0], ow + dx)
+        if "s" in edge:
+            h = max(MIN_WIN[1], oh + dy)
+        if "w" in edge:
+            w = max(MIN_WIN[0], ow - dx)
+            x = ox + (ow - w)
+        if "n" in edge:
+            h = max(MIN_WIN[1], oh - dy)
+            y = oy + (oh - h)
+        self.root.geometry("%dx%d+%d+%d" % (w, h, x, y))
+
+    def _on_win_release(self, _event):
+        if self._resizing:
+            self._resizing = None
 
     def _build_targets_tab(self):
         from tkinter import ttk
@@ -1589,12 +1935,32 @@ class CleanerApp(object):
         for iid in self.etree.selection():
             self._toggle_empty(iid)
 
+    @staticmethod
+    def _is_top_level_dir(path):
+        """
+        判断是不是盘符根的直接子目录（如 D:\\WeGameApps）。
+
+        这类空目录多半是程序自己建的占位目录，运行时才往里写东西，
+        删掉可能让程序报错。一键全选时跳过，真想删得单独勾。
+        """
+        _drive, tail = os.path.splitdrive(norm(path))
+        return len([p for p in tail.split(os.sep) if p]) <= 1
+
     def on_check_all(self):
         for t in self.targets:
             if t.exists is not False and t.level != LEVEL_RISKY:
                 t.checked = True
                 self._refresh_row(t)
+
+        skipped = 0
         for iid in self.etree.get_children():
+            try:
+                path = self.etree.item(iid, "values")[1]
+            except Exception:
+                path = ""
+            if self._is_top_level_dir(path):
+                skipped += 1
+                continue
             if iid not in self.empty_checked:
                 self.empty_checked.add(iid)
                 try:
@@ -1603,6 +1969,9 @@ class CleanerApp(object):
                     self.etree.item(iid, values=vals)
                 except Exception:
                     pass
+        if skipped:
+            self.log("已跳过 %d 个盘符根下的顶层空目录（多为程序占位目录），"
+                     "要清理请单独勾选" % skipped)
         self._update_summary()
 
     def on_check_none(self):
@@ -1774,11 +2143,13 @@ class CleanerApp(object):
                 for d in empty_sel:
                     if self.cancel.is_set():
                         break
-                    dn = norm(d)
-                    if any(dn == p or dn.startswith(p + os.sep)
-                           for p in PROTECTED_ROOTS):
+                    # 空目录是全盘扫出来的，不属于任何白名单目标（allowed_root=None），
+                    # 但硬禁区、保护区、盘符根、程序自身运行目录这些照样要过一遍
+                    try:
+                        guard(d)
+                    except GuardError as exc:
                         failed += 1
-                        self.msgq.put(("log", "  [拒绝] 位于保护区：%s" % d))
+                        self.msgq.put(("log", "  [拒绝] %s" % exc))
                         continue
                     try:
                         if os.path.isdir(d) and is_empty_dir(d):

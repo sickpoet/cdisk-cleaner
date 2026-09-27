@@ -104,7 +104,39 @@ check("human_size GB", C.human_size(1600000000).endswith("GB"),
       C.human_size(1600000000))
 check("disk_usage C 盘可读", C.disk_usage("C") is not None)
 check("disk_usage 支持带冒号", C.disk_usage("C:") is not None)
-check("long_path 短名展开", "~1" not in C.long_path(tmp) or "~1" in tmp)
+
+# long_path：造一个必然带 8.3 短名的目录，验证能展开回长名。
+# 坑：TEMP 本身可能就是短名形式（本机就是 C:\Users\ADMINI~1\...），
+# 所以不能拿展开结果跟 TEMP 比字符串，得验证「确实指向同一个目录」。
+_short_ok = None          # None = 本机不生成 8.3 短名，没得测，按跳过算
+_probe_root = None
+try:
+    import ctypes as _ct
+    _probe_root = tempfile.mkdtemp(prefix="cdisk_lp_")
+    _probe = os.path.join(_probe_root, "a_long_dir_name_for_83_probe")
+    os.makedirs(_probe, exist_ok=True)
+    _buf = _ct.create_unicode_buffer(32768)
+    _n = _ct.windll.kernel32.GetShortPathNameW(_probe, _buf, 32768)
+    _short = _buf.value if _n else ""
+    if _short and os.path.normcase(_short) != os.path.normcase(_probe):
+        # 真的拿到了 ~1 形式，这才有得测
+        _back = C.long_path(_short)
+        with open(os.path.join(_short, "probe.txt"), "w") as _fh:
+            _fh.write("x")
+        _short_ok = os.path.exists(os.path.join(_back, "probe.txt"))
+except Exception as _exc:  # noqa: BLE001
+    _short_ok = None
+finally:
+    if _probe_root:
+        try:
+            import shutil as _sh
+            _sh.rmtree(_probe_root, ignore_errors=True)
+        except Exception:
+            pass
+check("long_path 把 8.3 短名还原成长名", _short_ok is not False,
+      "还原结果指向了别的目录" if _short_ok is False else "")
+if _short_ok is None:
+    print("       （本机未生成 8.3 短名，此项按跳过处理）")
 
 print("\n=== 扫描与清理（临时目录内真实跑一遍）===")
 sandbox = tempfile.mkdtemp(prefix="cdisk_test_")
@@ -210,6 +242,94 @@ try:
 
     app.log("测试日志")
     check("日志可写入", "测试日志" in app.log_text.get("1.0", "end"))
+
+    # ---- 无边框窗口
+    # 上面为了让闪烁动画停下来把 alive 关了，这里得开回来：
+    # 最小化恢复靠的是 app 自己的轮询，alive=False 会让它直接返回，测出来的就是假失败
+    app.alive = True
+
+    # 先让窗口自己排完队里的事件（居中、重绘都是 after 排的），否则后面比几何会飘
+    import time as _time
+    for _i in range(12):
+        root.update()
+        _time.sleep(0.02)
+
+    check("已切到无边框", bool(root.overrideredirect()))
+
+    def _exstyle():
+        import ctypes as _ct
+        hwnd = _ct.windll.user32.GetParent(root.winfo_id())
+        get = _ct.windll.user32.GetWindowLongW
+        get.restype = _ct.c_long
+        return get(hwnd, -20)   # GWL_EXSTYLE
+
+    ex = _exstyle()
+    check("任务栏图标已补回（WS_EX_APPWINDOW）", bool(ex & 0x00040000), ex)
+    check("已去掉 WS_EX_TOOLWINDOW", not (ex & 0x00000080), ex)
+
+    wa = app._work_area()
+    check("能读到屏幕工作区", wa[2] > wa[0] and wa[3] > wa[1], wa)
+
+    rx, ry = root.winfo_rootx(), root.winfo_rooty()
+    rw, rh = root.winfo_width(), root.winfo_height()
+    check("左上角识别为 nw", app._edge_at(rx + 2, ry + 2) == "nw")
+    check("右下角识别为 se", app._edge_at(rx + rw - 2, ry + rh - 2) == "se")
+    check("上边缘识别为 n", app._edge_at(rx + rw // 2, ry + 2) == "n")
+    check("窗口中央不是边缘", app._edge_at(rx + rw // 2, ry + rh // 2) is None)
+
+    # 缩放：往内拖到超过下限，应停在最小尺寸
+    class _E(object):
+        def __init__(self, x, y):
+            self.x_root, self.y_root = x, y
+
+    app._on_win_press(_E(rx + rw - 2, ry + rh - 2))
+    app._on_win_drag(_E(rx + rw - 2 - 600, ry + rh - 2 - 600))
+    root.update()
+    got = root.winfo_width(), root.winfo_height()
+    app._on_win_release(None)
+    check("缩放不会小于最小尺寸", got[0] >= C.MIN_WIN[0] and got[1] >= C.MIN_WIN[1],
+          "%s vs %s" % (got, C.MIN_WIN))
+
+    # 最大化 / 还原
+    before = root.geometry()
+    app._toggle_max()
+    root.update()
+    check("最大化后高度接近工作区", root.winfo_height() >= wa[3] - wa[1] - 4,
+          root.geometry())
+    app._toggle_max()
+    root.update()
+    check("还原回原尺寸", root.geometry() == before,
+          "%s -> %s" % (before, root.geometry()))
+
+    # 最小化：无边框窗口直接 iconify 会报 "override-redirect flag is set"，
+    # 必须先把边框恢复回去。这里包一层探针，确认它真的调成功了。
+    _calls = []
+    _raw_iconify = root.iconify
+
+    def _spy():
+        try:
+            _raw_iconify()
+            _calls.append("ok")
+        except Exception as _e:  # noqa: BLE001
+            _calls.append("%s: %s" % (type(_e).__name__, _e))
+            raise
+
+    root.iconify = _spy
+    app._minimize()
+    for _i in range(20):
+        root.update()
+        _time.sleep(0.05)
+    root.iconify = _raw_iconify
+    check("最小化时 iconify 没报错", _calls == ["ok"], _calls)
+    check("最小化后窗口状态为 iconic", root.state() == "iconic", root.state())
+
+    root.deiconify()
+    for _i in range(20):
+        root.update()
+        _time.sleep(0.05)
+    check("恢复后回到 normal", root.state() == "normal", root.state())
+    check("恢复后仍是无边框", bool(root.overrideredirect()))
+    check("恢复后任务栏样式还在", bool(_exstyle() & 0x00040000))
 except Exception as exc:  # noqa: BLE001
     import traceback
     traceback.print_exc()

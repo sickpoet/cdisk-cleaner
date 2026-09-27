@@ -23,6 +23,7 @@ Windows 上一键清理 C 盘垃圾、临时文件和空文件夹的小工具。
   立刻释放空间，要再清空回收站才算数）。
 - **不做多余的事**：不常驻后台、不写注册表、不开机自启、不连网。
 - **零第三方依赖**：只用 Python 标准库。
+- **无边框界面**：标题栏也是自绘的，从标题栏到状态条统一配色。
 
 ## 绝对不碰的东西
 
@@ -94,8 +95,8 @@ python cdisk_cleaner.py
 
 ## 自检
 
-仓库带了一份回归自检，覆盖路径守卫的拦截与放行、扫描/清理的端到端流程，
-以及界面组件的接口：
+仓库带了一份回归自检（76 项），覆盖路径守卫的拦截与放行、扫描/清理的端到端流程、
+界面组件的接口，以及无边框窗口的任务栏样式、边缘缩放与最小化恢复：
 
 ```bash
 python selftest.py
@@ -127,10 +128,19 @@ python build_exe.py
 - **界面**：tkinter。配色是自绘出来的——ttk 先切到 `clam` 主题（Windows 原生主题
   不接受颜色覆盖），再逐项染色；按钮和单选按钮用 Canvas 画切角描边，
   所以看起来不太像原生控件。
-- **深色标题栏**：调 `DwmSetWindowAttribute(DWMWA_USE_IMMERSIVE_DARK_MODE)`。
-  必须用 `GetParent(winfo_id())` 取顶层窗口句柄——`winfo_id()` 给的是 Tk 的内层窗口，
-  拿它调用一律返回 `E_HANDLE`。另外 Win10 的部分环境（远程会话、禁用 DWM 合成）
-  不会渲染这个属性，调用会返回成功但外观不变，属于系统行为。
+- **无边框窗口**：`overrideredirect(True)` 去掉系统标题栏，整条标题栏（最小化 /
+  最大化 / 关闭 / 拖动 / 边缘缩放）都是自绘的。这个调用会顺手丢掉三样东西，都补了回来：
+  - **任务栏图标** → 窗口会变成 `WS_POPUP` + `WS_EX_TOOLWINDOW`，从任务栏和 Alt+Tab
+    一起消失。用 `SetWindowLongW` 把扩展样式换成 `WS_EX_APPWINDOW`
+  - **最小化** → 无边框窗口调 `iconify()` 会直接报
+    `override-redirect flag is set`。先临时恢复边框再最小化，之后轮询 `state()`
+    等它回来，再把边框去掉（不监听 `<Map>`：`deiconify()` 实测不触发它，
+    而 `overrideredirect(False)` 反而会触发一次，混在一起没法区分）
+  - **边缘缩放** → 自己判定边缘热区（6px）并改 geometry，按最小尺寸夹住
+
+  万一 `overrideredirect` 没设上，会退回原生边框 + 深色标题栏
+  （`DwmSetWindowAttribute` attr 20；HWND 必须用 `GetParent(winfo_id())` 取，
+  直接拿 `winfo_id()` 调用一律返回 `E_HANDLE`）。
 - **回收站大小**：直接遍历 `$Recycle.Bin`，**不用** `SHQueryRecycleBin`。
   本机回收站有 16 万项时那个 API 要跑 50 秒（它会逐个解析 `$I` 元数据），
   改成遍历只要 6 秒。这项统计在单独线程跑，不拖住其他不到 1 秒的项目。

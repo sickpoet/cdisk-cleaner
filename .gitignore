@@ -8,6 +8,14 @@ dist/
 *.spec
 version_info.txt
 
+# 本地工作目录（Agent 笔记、临时脚本、临时构建目录等）
+.workbuddy/
+_*/
+_*.py
+_*.md
+_*.png
+_*.log
+
 .venv/
 venv/
 env/

@@ -138,8 +138,6 @@ def find_upx(explicit=None):
     if os.environ.get("UPX_DIR"):
         cands.append(os.environ["UPX_DIR"])
     cands.append(os.path.join(here(), "tools", "upx"))
-    # 本机其它项目里放过一份，拿来做兜底
-    cands.append(r"F:\AI\OPANAI-X\CodexAPI\tools\upx-5.2.1-win64")
 
     for c in cands:
         if c and os.path.isfile(os.path.join(c, "upx.exe")):
@@ -151,12 +149,36 @@ def find_upx(explicit=None):
     return None
 
 
+def try_remove(path):
+    """
+    尽力删掉一个文件，失败当没发生。
+
+    删不掉不影响结果：PyInstaller 带 --noconfirm，自己会覆盖旧产物。
+    文件被占用、权限不足、系统策略拦删除，都可能走到这里。
+    """
+    if not os.path.exists(path):
+        return
+    try:
+        os.remove(path)
+    except BaseException:  # noqa: BLE001
+        pass
+
+
 def clean_old():
-    """删掉旧产物。不用 --clean，那个批量删缓存会被沙箱拦。"""
-    for d in (BUILD_DIR, DIST_DIR):
-        p = os.path.join(here(), d)
-        if os.path.isdir(p):
-            shutil.rmtree(p, ignore_errors=True)
+    """
+    清掉旧产物，让 PyInstaller 重新分析。
+
+    不整目录 rmtree：几百个小文件的删除又慢又容易被系统策略整批拦下，
+    而且没必要。只删「能让 PyInstaller 判定需要重建」的最小集合：
+    目标 exe + build/<name>/ 下的 .toc。其余缓存留着反而更快。
+    """
+    try_remove(os.path.join(here(), DIST_DIR, APP_NAME + ".exe"))
+
+    cache = os.path.join(here(), BUILD_DIR, APP_NAME)
+    if os.path.isdir(cache):
+        for name in os.listdir(cache):
+            if name.endswith(".toc") or name == "warn-%s.txt" % APP_NAME:
+                try_remove(os.path.join(cache, name))
 
 
 def main():
