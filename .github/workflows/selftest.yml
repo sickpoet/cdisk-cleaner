@@ -21,5 +21,9 @@ jobs:
 
       # --no-gui：runner 上没有可用的桌面会话，建不出 Tk 窗口。
       # 路径守卫、扫描与清理的端到端用例本来就不依赖 tkinter，照样跑。
+      # PYTHONIOENCODING：windows runner 的控制台默认是 cp1252 而非 UTF-8，
+      # 脚本里的中文（尤其全角括号）一 print 就 UnicodeEncodeError 直接崩。
       - name: 回归自检
+        env:
+          PYTHONIOENCODING: utf-8
         run: python selftest.py --no-gui
